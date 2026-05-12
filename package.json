@@ -1,8 +1,8 @@
 {
   "name": "vanish-fullstack",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
-  "description": "VANISH anonymous text chat with Google account dashboard",
+  "description": "VANISH anonymous text chat with Google dashboard, games, and image sharing",
   "scripts": {
     "dev:client": "npm --prefix client run dev",
     "dev:server": "npm --prefix server run dev",
