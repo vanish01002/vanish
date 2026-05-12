@@ -27,10 +27,15 @@ function formatTime(sec) {
 function defaultWsUrl() {
   const fromEnv = import.meta.env.VITE_WS_URL;
   if (fromEnv) return fromEnv;
+
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const host = window.location.hostname || "localhost";
-  const port = window.location.port === "3001" ? "3001" : "3001";
-  return `${protocol}//${host}:${port}`;
+  const isLocalhost = ["localhost", "127.0.0.1"].includes(window.location.hostname);
+
+  const host = isLocalhost && window.location.port !== "3001"
+    ? `${window.location.hostname}:3001`
+    : window.location.host;
+
+  return `${protocol}//${host}`;
 }
 
 function sanitizeProfile(profile) {
