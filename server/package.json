@@ -8,6 +8,7 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "google-auth-library": "latest",
     "ws": "latest"
   }
 }

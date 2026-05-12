@@ -2,14 +2,20 @@ const http = require("http");
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
+const { URL } = require("url");
 const { WebSocketServer } = require("ws");
+const { OAuth2Client } = require("google-auth-library");
 
 const PORT = Number(process.env.PORT || 3001);
 const CLIENT_DIST = path.resolve(__dirname, "../client/dist");
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || process.env.VITE_GOOGLE_CLIENT_ID || "";
 const MAX_MESSAGE_LENGTH = 1500;
 const MESSAGE_RATE_LIMIT = { max: 12, windowMs: 10_000 };
 const QUEUE_TIMEOUT_MS = 5 * 60 * 1000;
 
+const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null;
+const accounts = new Map(); // googleSub -> account
+const sessions = new Map(); // sessionToken -> account
 const clients = new Map(); // ws -> client
 const rooms = new Map(); // roomId -> room
 const waiting = []; // client[]
@@ -23,13 +29,97 @@ function now() {
   return Date.now();
 }
 
+function json(res, status, body) {
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type,Authorization"
+  });
+  res.end(JSON.stringify(body));
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk.toString();
+      if (body.length > 1_000_000) {
+        req.destroy();
+        reject(new Error("Request body too large"));
+      }
+    });
+    req.on("end", () => {
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch {
+        reject(new Error("Invalid JSON"));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+function publicUser(account) {
+  return {
+    id: account.id,
+    name: account.name,
+    email: account.email,
+    picture: account.picture,
+    provider: account.provider
+  };
+}
+
+async function handleGoogleAuth(req, res) {
+  if (!googleClient || !GOOGLE_CLIENT_ID) {
+    return json(res, 503, {
+      message: "Google login is not configured. Add GOOGLE_CLIENT_ID and VITE_GOOGLE_CLIENT_ID in Render."
+    });
+  }
+
+  try {
+    const body = await readBody(req);
+    const credential = String(body.credential || "");
+    if (!credential) return json(res, 400, { message: "Missing Google credential." });
+
+    const ticket = await googleClient.verifyIdToken({
+      idToken: credential,
+      audience: GOOGLE_CLIENT_ID
+    });
+    const payload = ticket.getPayload();
+    if (!payload?.sub || !payload?.email) return json(res, 401, { message: "Invalid Google account." });
+
+    const account = {
+      id: `google_${payload.sub}`,
+      googleSub: payload.sub,
+      email: payload.email,
+      name: payload.name || payload.email.split("@")[0],
+      picture: payload.picture || "",
+      provider: "google",
+      createdAt: new Date().toISOString(),
+      lastLoginAt: new Date().toISOString()
+    };
+
+    accounts.set(payload.sub, account);
+    const sessionToken = crypto.randomBytes(32).toString("hex");
+    sessions.set(sessionToken, account);
+
+    return json(res, 200, {
+      sessionToken,
+      user: publicUser(account)
+    });
+  } catch (error) {
+    return json(res, 401, { message: "Google login verification failed." });
+  }
+}
+
 function safeProfile(profile = {}) {
   return {
     displayName: String(profile.displayName || profile.name || "Anonymous").slice(0, 24),
     gender: String(profile.gender || "Prefer not to say").slice(0, 32),
-    ageGroup: String(profile.ageGroup || "18-24").slice(0, 16),
+    ageGroup: String(profile.ageGroup || "18–24").slice(0, 16),
     country: String(profile.country || "Hidden").slice(0, 56),
-    chatPreference: String(profile.chatPreference || "Text").slice(0, 16),
+    chatPreference: "Text",
     interests: Array.isArray(profile.interests)
       ? profile.interests.map((x) => String(x).slice(0, 24)).slice(0, 8)
       : []
@@ -73,7 +163,6 @@ function profileCompatible(a, b, requireSameCountry) {
   if (a === b) return false;
   if (a.roomId || b.roomId) return false;
   if (a.ws.readyState !== a.ws.OPEN || b.ws.readyState !== b.ws.OPEN) return false;
-  if (a.profile.chatPreference !== b.profile.chatPreference) return false;
   if (requireSameCountry && a.profile.country !== b.profile.country) return false;
   return true;
 }
@@ -94,7 +183,7 @@ function createRoom(a, b) {
     id: roomId,
     a,
     b,
-    mode: a.profile.chatPreference,
+    mode: "Text",
     createdAt: now(),
     buffer: []
   };
@@ -157,8 +246,8 @@ function leaveRoom(client, reason = "left") {
   if (other) {
     other.roomId = null;
     other.state = "idle";
+    other.typingState = false;
     send(other.ws, "stranger:left", { reason });
-    send(other.ws, "webrtc:hangup", { reason });
   }
 }
 
@@ -189,22 +278,11 @@ function relayChat(client, rawText) {
   send(other.ws, "chat:message", { text });
 }
 
-function relayToRoom(client, type, payload = {}) {
-  const room = rooms.get(client.roomId);
-  if (!room) return sendError(client.ws, "You are not connected to a stranger.");
-  const other = otherClient(room, client);
-  if (!other) return;
-  send(other.ws, type, payload);
-}
-
 function relayTyping(client, isTyping) {
   const room = rooms.get(client.roomId);
   if (!room) return;
 
   const nextState = Boolean(isTyping);
-
-  // Prevent duplicate typing events. A user pressing multiple keys/spaces
-  // should not create repeated "Stranger is typing..." indicators.
   if (client.typingState === nextState) return;
 
   client.typingState = nextState;
@@ -222,6 +300,8 @@ function reportUser(client, reason) {
     id: id("report"),
     roomId: room.id,
     reason: String(reason || "No reason provided").slice(0, 280),
+    reporterAccountId: client.account?.id || null,
+    reportedAccountId: other?.account?.id || null,
     reporterProfile: safeProfile(client.profile),
     reportedProfile: safeProfile(other?.profile),
     evidenceSnapshot: room.buffer.slice(-20),
@@ -261,35 +341,23 @@ function handleMessage(client, raw) {
       break;
 
     case "chat:message":
-    case "message":
       relayChat(client, payload.text);
       break;
 
     case "chat:typing":
-    case "typing":
-      relayTyping(client, Boolean(payload.isTyping ?? payload.typing));
-      break;
-
-    case "match:skip":
-    case "skip":
-      leaveRoom(client, "skipped");
-      if (payload.profile) joinQueue(client, payload.profile);
+      relayTyping(client, payload.isTyping);
       break;
 
     case "chat:leave":
-    case "leave":
       leaveRoom(client, "left");
+      break;
+
+    case "match:skip":
+      leaveRoom(client, "skipped");
       break;
 
     case "report:user":
       reportUser(client, payload.reason);
-      break;
-
-    case "webrtc:offer":
-    case "webrtc:answer":
-    case "webrtc:ice":
-    case "webrtc:hangup":
-      relayToRoom(client, type, payload);
       break;
 
     default:
@@ -298,100 +366,88 @@ function handleMessage(client, raw) {
 }
 
 function serveStatic(req, res) {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-
-  if (url.pathname === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      ok: true,
-      service: "vanish-server",
-      online: clients.size,
-      waiting: waiting.length,
-      rooms: rooms.size
-    }));
-    return;
-  }
-
-  if (url.pathname === "/auth/google" && req.method === "POST") {
-    let body = "";
-    req.on("data", (chunk) => (body += chunk));
-    req.on("end", () => {
-      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-      res.end(JSON.stringify({
-        user: { id: id("user"), name: "Guest User", email: "hidden@vanish.local", picture: null },
-        sessionToken: id("session")
-      }));
-    });
-    return;
-  }
-
   if (req.method === "OPTIONS") {
-    res.writeHead(204, {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type,Authorization"
+    return json(res, 200, { ok: true });
+  }
+
+  const parsed = new URL(req.url, `http://${req.headers.host}`);
+
+  if (parsed.pathname === "/api/health" && req.method === "GET") {
+    return json(res, 200, {
+      ok: true,
+      online: clients.size,
+      rooms: rooms.size,
+      waiting: waiting.length,
+      googleAuthConfigured: Boolean(GOOGLE_CLIENT_ID)
     });
-    res.end();
-    return;
   }
 
-  let filePath = path.join(CLIENT_DIST, url.pathname === "/" ? "index.html" : url.pathname);
-  if (!filePath.startsWith(CLIENT_DIST)) {
+  if (parsed.pathname === "/api/auth/google" && req.method === "POST") {
+    return handleGoogleAuth(req, res);
+  }
+
+  let requested = decodeURIComponent(parsed.pathname);
+  if (requested === "/") requested = "/index.html";
+
+  const filePath = path.join(CLIENT_DIST, requested);
+  const resolved = path.resolve(filePath);
+  if (!resolved.startsWith(CLIENT_DIST)) {
     res.writeHead(403);
-    res.end("Forbidden");
-    return;
+    return res.end("Forbidden");
   }
 
-  if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
-    filePath = path.join(CLIENT_DIST, "index.html");
-  }
+  const target = fs.existsSync(resolved) && fs.statSync(resolved).isFile()
+    ? resolved
+    : path.join(CLIENT_DIST, "index.html");
 
-  if (!fs.existsSync(filePath)) {
+  if (!fs.existsSync(target)) {
     res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("VANISH backend is running. Build the client with `npm run build`, then start again to serve the web app.");
-    return;
+    return res.end("VANISH backend is running. Build the frontend with npm run build.");
   }
 
-  const ext = path.extname(filePath).toLowerCase();
-  const types = {
+  const ext = path.extname(target).toLowerCase();
+  const contentType = {
     ".html": "text/html; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
     ".css": "text/css; charset=utf-8",
+    ".json": "application/json",
     ".svg": "image/svg+xml",
-    ".json": "application/json"
-  };
-  res.writeHead(200, { "Content-Type": types[ext] || "application/octet-stream" });
-  fs.createReadStream(filePath).pipe(res);
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".ico": "image/x-icon"
+  }[ext] || "application/octet-stream";
+
+  res.writeHead(200, { "Content-Type": contentType });
+  fs.createReadStream(target).pipe(res);
 }
 
 const server = http.createServer(serveStatic);
 const wss = new WebSocketServer({ server });
 
 wss.on("connection", (ws, req) => {
+  const parsed = new URL(req.url, `http://${req.headers.host}`);
+  const token = parsed.searchParams.get("token") || "";
+  const account = token ? sessions.get(token) || null : null;
+
   const client = {
-    id: id("socket"),
+    id: id("client"),
     ws,
+    account,
     profile: null,
     roomId: null,
     state: "idle",
-    typingState: false,
     queuedAt: null,
     messageHits: [],
-    connectedAt: now(),
-    ipHash: crypto.createHash("sha256").update(req.socket.remoteAddress || "unknown").digest("hex")
+    typingState: false,
+    connectedAt: now()
   };
 
   clients.set(ws, client);
-  ws.isAlive = true;
-
-  send(ws, "connected", {
-    socketId: client.id,
+  send(ws, "server:hello", {
+    clientId: client.id,
     online: clients.size,
-    message: "Connected to VANISH realtime server."
-  });
-
-  ws.on("pong", () => {
-    ws.isAlive = true;
+    account: account ? publicUser(account) : null
   });
 
   ws.on("message", (raw) => handleMessage(client, raw));
@@ -401,33 +457,20 @@ wss.on("connection", (ws, req) => {
     leaveRoom(client, "disconnected");
     clients.delete(ws);
   });
-
-  ws.on("error", () => {
-    removeFromQueue(client);
-    leaveRoom(client, "connection_error");
-    clients.delete(ws);
-  });
 });
 
 setInterval(() => {
   cleanQueue();
-  for (const ws of wss.clients) {
-    if (!ws.isAlive) {
-      const client = clients.get(ws);
-      if (client) {
-        removeFromQueue(client);
-        leaveRoom(client, "timeout");
-        clients.delete(ws);
-      }
-      ws.terminate();
-      continue;
-    }
-    ws.isAlive = false;
-    ws.ping();
+  for (const ws of clients.keys()) {
+    send(ws, "server:stats", {
+      online: clients.size,
+      waiting: waiting.length,
+      rooms: rooms.size
+    });
   }
-}, 30_000);
+}, 15_000);
 
 server.listen(PORT, () => {
-  console.log(`VANISH server running on http://localhost:${PORT}`);
-  console.log(`WebSocket endpoint: ws://localhost:${PORT}`);
+  console.log(`VANISH server running on port ${PORT}`);
+  console.log(`Google login configured: ${Boolean(GOOGLE_CLIENT_ID)}`);
 });
