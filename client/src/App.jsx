@@ -231,8 +231,7 @@ function Chat({
   seconds,
   bottomRef,
   status,
-  callProps,
-  isStrangerTyping
+  callProps
 }) {
   const handleKeyDown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -264,7 +263,6 @@ function Chat({
 
       <main className="messages">
         {messages.map((message) => <MessageBubble key={message.id} message={message} />)}
-        {isStrangerTyping && <p className="system-message typing-indicator">— Stranger is typing... —</p>}
         <div ref={bottomRef} />
       </main>
 
@@ -273,16 +271,8 @@ function Chat({
           rows={1}
           value={input}
           onChange={(e) => {
-            const value = e.target.value;
-            setInput(value);
-
-            // Do not send typing events for empty input or only spaces.
-            // This prevents repeated "Stranger is typing" signals when users press space.
-            if (value.trim().length > 0) {
-              onTyping(true);
-            } else {
-              onTyping(false);
-            }
+            setInput(e.target.value);
+            onTyping(true);
           }}
           onKeyDown={handleKeyDown}
           placeholder={`Message as ${profile.displayName}`}
@@ -300,9 +290,6 @@ export default function App() {
   const eventHandlerRef = useRef(null);
   const bottomRef = useRef(null);
   const typingStopRef = useRef(null);
-  const remoteTypingStopRef = useRef(null);
-  const localTypingActiveRef = useRef(false);
-  const lastTypingSentRef = useRef(0);
   const timerRef = useRef(null);
   const pcRef = useRef(null);
   const localVideoRef = useRef(null);
@@ -325,7 +312,6 @@ export default function App() {
   const [roomId, setRoomId] = useState(null);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
-  const [isStrangerTyping, setIsStrangerTyping] = useState(false);
   const [seconds, setSeconds] = useState(0);
   const [incomingOffer, setIncomingOffer] = useState(null);
   const [incomingKind, setIncomingKind] = useState(null);
@@ -339,19 +325,6 @@ export default function App() {
   const addSystem = (text) => setMessages((m) => [...m, { id: crypto.randomUUID(), type: "system", text }]);
   const addMine = (text) => setMessages((m) => [...m, { id: crypto.randomUUID(), type: "me", text }]);
   const addTheirs = (text) => setMessages((m) => [...m, { id: crypto.randomUUID(), type: "them", text }]);
-
-  const stopRemoteTyping = () => {
-    clearTimeout(remoteTypingStopRef.current);
-    setIsStrangerTyping(false);
-  };
-
-  const stopLocalTyping = () => {
-    clearTimeout(typingStopRef.current);
-    if (localTypingActiveRef.current) {
-      wsSend("chat:typing", { isTyping: false });
-      localTypingActiveRef.current = false;
-    }
-  };
 
   const wsSend = (type, payload = {}) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -483,8 +456,6 @@ export default function App() {
       setRoomId(payload.roomId);
       setStranger(payload.stranger);
       setMessages([{ id: crypto.randomUUID(), type: "system", text: "Connected to a stranger. Say hi." }]);
-      stopRemoteTyping();
-      localTypingActiveRef.current = false;
       setInput("");
       setSeconds(0);
       setScreen("chat");
@@ -492,19 +463,12 @@ export default function App() {
     }
 
     if (type === "chat:message") {
-      stopRemoteTyping();
       addTheirs(payload.text);
       return;
     }
 
     if (type === "chat:typing") {
-      if (payload.isTyping) {
-        setIsStrangerTyping(true);
-        clearTimeout(remoteTypingStopRef.current);
-        remoteTypingStopRef.current = setTimeout(() => setIsStrangerTyping(false), 1400);
-      } else {
-        stopRemoteTyping();
-      }
+      if (payload.isTyping) addSystem("Stranger is typing...");
       return;
     }
 
@@ -512,8 +476,6 @@ export default function App() {
       cleanupCall(false);
       setRoomId(null);
       setStranger(null);
-      stopRemoteTyping();
-      localTypingActiveRef.current = false;
       addSystem(`Stranger ${payload.reason || "left"}.`);
       return;
     }
@@ -599,7 +561,7 @@ export default function App() {
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, isStrangerTyping]);
+  }, [messages]);
 
   useEffect(() => {
     if (screen === "chat") {
@@ -625,8 +587,6 @@ export default function App() {
     const clean = sanitizeProfile(profile);
     setProfile(clean);
     setMessages([]);
-    stopRemoteTyping();
-    localTypingActiveRef.current = false;
     setStranger(null);
     setRoomId(null);
     setSeconds(0);
@@ -646,37 +606,20 @@ export default function App() {
     if (wsSend("chat:message", { text })) {
       addMine(text);
       setInput("");
-      stopLocalTyping();
+      wsSend("chat:typing", { isTyping: false });
     }
   };
 
-  const sendTyping = (isTyping = true) => {
+  const sendTyping = () => {
     if (!roomId) return;
-
-    if (!isTyping) {
-      stopLocalTyping();
-      return;
-    }
-
-    const current = Date.now();
-
-    // Send only one "typing: true" event per active typing session.
-    // Extra key presses/spaces only refresh the local debounce timer.
-    if (!localTypingActiveRef.current && current - lastTypingSentRef.current > 700) {
-      wsSend("chat:typing", { isTyping: true });
-      localTypingActiveRef.current = true;
-      lastTypingSentRef.current = current;
-    }
-
+    wsSend("chat:typing", { isTyping: true });
     clearTimeout(typingStopRef.current);
-    typingStopRef.current = setTimeout(stopLocalTyping, 1500);
+    typingStopRef.current = setTimeout(() => wsSend("chat:typing", { isTyping: false }), 900);
   };
 
   const nextStranger = () => {
     cleanupCall(true);
     setMessages([]);
-    stopRemoteTyping();
-    localTypingActiveRef.current = false;
     setStranger(null);
     setRoomId(null);
     setSeconds(0);
@@ -688,8 +631,6 @@ export default function App() {
     cleanupCall(true);
     wsSend("chat:leave", {});
     setMessages([]);
-    stopRemoteTyping();
-    localTypingActiveRef.current = false;
     setStranger(null);
     setRoomId(null);
     setSeconds(0);
@@ -740,7 +681,6 @@ export default function App() {
             bottomRef={bottomRef}
             status={status}
             callProps={callProps}
-            isStrangerTyping={isStrangerTyping}
           />
         )}
       </div>
