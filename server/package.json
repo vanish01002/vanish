@@ -1,0 +1,13 @@
+{
+  "name": "vanish-server",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "dev": "node --watch index.js",
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ws": "latest"
+  }
+}

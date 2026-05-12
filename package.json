@@ -1,0 +1,15 @@
+{
+  "name": "vanish-fullstack",
+  "version": "1.0.0",
+  "private": true,
+  "description": "VANISH anonymous stranger chat/call full-stack MVP",
+  "scripts": {
+    "dev:client": "npm --prefix client run dev",
+    "dev:server": "npm --prefix server run dev",
+    "build": "npm --prefix client run build",
+    "start": "npm --prefix server start"
+  },
+  "keywords": ["anonymous-chat", "websocket", "webrtc", "react"],
+  "author": "",
+  "license": "MIT"
+}
