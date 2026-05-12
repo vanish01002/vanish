@@ -1,8 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
 const AGE_GROUPS = ["18–24", "25–34", "35–44", "45+"];
 const GENDERS = ["Male", "Female", "Non-binary", "Prefer not to say"];
-const CHAT_PREFS = ["Text", "Voice", "Video"];
 const INTERESTS = ["Music", "Gaming", "Movies", "Books", "Coding", "Travel", "Food", "Sports", "Art", "Anime", "Fitness", "Startups"];
 const COUNTRIES = [
   "Bangladesh", "United States", "India", "Pakistan", "Nepal", "Sri Lanka", "United Kingdom", "Canada", "Australia",
@@ -12,30 +11,76 @@ const COUNTRIES = [
   "Mexico", "Argentina", "Other"
 ];
 const ALIASES = ["Cipher", "Ghost", "Nova", "Echo", "Raven", "Drift", "Myst", "Void", "Astra", "Pixel", "Orbit", "Frost"];
+const STORAGE_KEY = "vanish_session_v2";
+const UI_BUILD = "ui-restore-2026-05-12";
+const MAX_MEDIA_BYTES = 1_000_000;
+const ALLOWED_MEDIA_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
 
 function randomAlias() {
   const base = ALIASES[Math.floor(Math.random() * ALIASES.length)];
   return `${base}#${Math.floor(1000 + Math.random() * 9000)}`;
 }
 
-function formatTime(sec) {
-  const m = Math.floor(sec / 60).toString().padStart(2, "0");
-  const s = (sec % 60).toString().padStart(2, "0");
-  return `${m}:${s}`;
+function defaultWsUrl(sessionToken) {
+  const fromEnv = import.meta.env.VITE_WS_URL;
+  let base;
+
+  if (fromEnv) {
+    base = fromEnv;
+  } else {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const isLocalhost = ["localhost", "127.0.0.1"].includes(window.location.hostname);
+    const host = isLocalhost && window.location.port !== "3001"
+      ? `${window.location.hostname}:3001`
+      : window.location.host;
+    base = `${protocol}//${host}`;
+  }
+
+  if (!sessionToken) return base;
+  const joiner = base.includes("?") ? "&" : "?";
+  return `${base}${joiner}token=${encodeURIComponent(sessionToken)}`;
 }
 
-function defaultWsUrl() {
-  const fromEnv = import.meta.env.VITE_WS_URL;
-  if (fromEnv) return fromEnv;
+function apiUrl(path) {
+  const base = import.meta.env.VITE_API_URL || "";
+  return `${base}${path}`;
+}
 
-  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const isLocalhost = ["localhost", "127.0.0.1"].includes(window.location.hostname);
+function getStoredSession() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? normalizeSession(JSON.parse(raw)) : null;
+  } catch {
+    clearStoredSession();
+    return null;
+  }
+}
 
-  const host = isLocalhost && window.location.port !== "3001"
-    ? `${window.location.hostname}:3001`
-    : window.location.host;
+function saveSession(session) {
+  const normalized = normalizeSession(session);
+  if (normalized) localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
+}
 
-  return `${protocol}//${host}`;
+function clearStoredSession() {
+  localStorage.removeItem(STORAGE_KEY);
+}
+
+function normalizeSession(session) {
+  if (!session || typeof session !== "object") return null;
+
+  const rawUser = session.user || session.account || {};
+  const sessionToken = typeof session.sessionToken === "string" ? session.sessionToken : "";
+  const provider = rawUser.provider || (sessionToken ? "google" : "guest");
+
+  return {
+    sessionToken,
+    user: {
+      name: rawUser.name || rawUser.displayName || (rawUser.email ? String(rawUser.email).split("@")[0] : "Guest User"),
+      email: rawUser.email || (provider === "guest" ? "guest@vanish.local" : ""),
+      picture: rawUser.picture || rawUser.photo || "",
+      provider
+    }
+  };
 }
 
 function sanitizeProfile(profile) {
@@ -44,9 +89,21 @@ function sanitizeProfile(profile) {
     gender: profile.gender,
     ageGroup: profile.ageGroup,
     country: profile.country,
-    chatPreference: profile.chatPreference,
+    chatPreference: "Text",
     interests: profile.interests.slice(0, 8)
   };
+}
+
+function formatTime(sec) {
+  const m = Math.floor(sec / 60).toString().padStart(2, "0");
+  const s = (sec % 60).toString().padStart(2, "0");
+  return `${m}:${s}`;
+}
+
+function formatBytes(bytes = 0) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function StatusDot({ status }) {
@@ -61,29 +118,130 @@ function Chip({ label, active, onClick }) {
   );
 }
 
-function Landing({ status, onStart }) {
+function GoogleButton({ onSuccess, onError }) {
+  const ref = useRef(null);
+  const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
+
+  useEffect(() => {
+    if (!clientId || !ref.current) return;
+
+    let cancelled = false;
+
+    function renderButton() {
+      if (cancelled || !window.google?.accounts?.id || !ref.current) return;
+      window.google.accounts.id.initialize({
+        client_id: clientId,
+        callback: async (response) => {
+          try {
+            const res = await fetch(apiUrl("/api/auth/google"), {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ credential: response.credential })
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.message || "Google login failed");
+            onSuccess(data);
+          } catch (error) {
+            onError(error.message || "Google login failed");
+          }
+        }
+      });
+      window.google.accounts.id.renderButton(ref.current, {
+        theme: "filled_black",
+        size: "large",
+        shape: "pill",
+        text: "continue_with",
+        width: 320
+      });
+    }
+
+    if (window.google?.accounts?.id) {
+      renderButton();
+      return () => { cancelled = true; };
+    }
+
+    const existing = document.querySelector('script[src="https://accounts.google.com/gsi/client"]');
+    if (existing) {
+      existing.addEventListener("load", renderButton, { once: true });
+      return () => { cancelled = true; existing.removeEventListener("load", renderButton); };
+    }
+
+    const script = document.createElement("script");
+    script.src = "https://accounts.google.com/gsi/client";
+    script.async = true;
+    script.defer = true;
+    script.onload = renderButton;
+    script.onerror = () => onError("Could not load Google sign-in script.");
+    document.head.appendChild(script);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [clientId, onError, onSuccess]);
+
+  if (!clientId) {
+    return (
+      <div className="google-missing">
+        <strong>Google login is not configured.</strong>
+        <span>Add VITE_GOOGLE_CLIENT_ID in Render environment variables.</span>
+      </div>
+    );
+  }
+
+  return <div className="google-button" ref={ref} />;
+}
+
+function LoginScreen({ onLogin }) {
+  const [error, setError] = useState("");
+
+  const handleGoogleSuccess = (data) => {
+    const session = {
+      sessionToken: data.sessionToken,
+      user: data.user
+    };
+    saveSession(session);
+    onLogin(session);
+  };
+
+  const handleGuest = () => {
+    const guest = {
+      sessionToken: "",
+      user: {
+        name: "Guest User",
+        email: "guest@vanish.local",
+        picture: "",
+        provider: "guest"
+      }
+    };
+    saveSession(guest);
+    onLogin(guest);
+  };
+
   return (
-    <section className="screen center-screen">
+    <section className="screen center-screen login-screen">
       <div className="brand-mark">V</div>
       <p className="eyebrow">ANONYMOUS STRANGER CHAT</p>
       <h1>VANISH</h1>
       <p className="hero-copy">
-        Meet strangers by display name, gender, age group, country, interests, and chat preference. No real names are shown.
+        Sign in to manage your account dashboard, then chat anonymously with strangers using only your VANISH profile.
       </p>
-      <div className="feature-grid">
-        <div><strong>Real matching</strong><span>WebSocket room relay</span></div>
-        <div><strong>Anonymous profile</strong><span>Country only, no exact location</span></div>
-        <div><strong>Calls included</strong><span>WebRTC voice/video signaling</span></div>
-        <div><strong>Safety layer</strong><span>Rate limit, report, skip, end</span></div>
+
+      <div className="login-card">
+        <GoogleButton onSuccess={handleGoogleSuccess} onError={setError} />
+        <button className="secondary-btn wide" onClick={handleGuest}>Continue as guest for testing</button>
+        {error ? <p className="error-box">{error}</p> : null}
       </div>
-      <button className="primary-btn wide" onClick={onStart}>Continue anonymously</button>
-      <p className="connection-line"><StatusDot status={status} /> Realtime server: {status}</p>
+
+      <div className="privacy-note">
+        <strong>Privacy rule:</strong> your Google name and email stay in your account dashboard. Strangers only see your display name, gender, age group, country, interests, chat messages, game moves, and images you manually send.
+      </div>
     </section>
   );
 }
 
-function Onboarding({ profile, setProfile, status, online, onFind }) {
-  const valid = profile.displayName.trim() && profile.gender && profile.ageGroup && profile.country && profile.chatPreference;
+function Dashboard({ account, profile, setProfile, status, online, onFind, onLogout }) {
+  const safeAccount = account || { name: "Guest User", email: "Guest mode", picture: "", provider: "guest" };
+  const valid = profile.displayName.trim() && profile.gender && profile.ageGroup && profile.country;
 
   const toggleInterest = (interest) => {
     setProfile((p) => ({
@@ -95,49 +253,106 @@ function Onboarding({ profile, setProfile, status, online, onFind }) {
   };
 
   return (
-    <section className="screen form-screen">
-      <div className="topbar">
+    <section className="screen dashboard-screen">
+      <div className="dashboard-header">
         <div>
-          <p className="eyebrow">SETUP</p>
-          <h2>Create your vanish profile</h2>
+          <p className="eyebrow">DASHBOARD</p>
+          <h2>Welcome to VANISH</h2>
+          <p className="muted">Create your anonymous public profile before matching.</p>
         </div>
-        <p className="server-pill"><StatusDot status={status} /> {online} online</p>
+        <div className="account-card mini">
+          {safeAccount.picture ? <img src={safeAccount.picture} alt="Google profile" /> : <div className="avatar-fallback">{(safeAccount.name || "G").slice(0, 1)}</div>}
+          <div>
+            <strong>{safeAccount.name || "Guest User"}</strong>
+            <span>{safeAccount.email || "Guest mode"}</span>
+          </div>
+          <button className="small-btn" onClick={onLogout}>Logout</button>
+        </div>
       </div>
 
-      <label className="field-label">Display name</label>
-      <div className="input-row">
-        <input
-          value={profile.displayName}
-          maxLength={24}
-          onChange={(e) => setProfile((p) => ({ ...p, displayName: e.target.value }))}
-          placeholder="Example: Ghost#1942"
-        />
-        <button className="small-btn" type="button" onClick={() => setProfile((p) => ({ ...p, displayName: randomAlias() }))}>↻</button>
+      <div className="dashboard-grid">
+        <div className="panel profile-panel">
+          <div className="panel-title">
+            <div>
+              <p className="eyebrow">PROFILE</p>
+              <h3>Anonymous public identity</h3>
+            </div>
+            <button className="small-btn" onClick={() => setProfile((p) => ({ ...p, displayName: randomAlias() }))}>Random name</button>
+          </div>
+
+          <label className="field-label">Display name</label>
+          <input
+            value={profile.displayName}
+            maxLength={24}
+            onChange={(e) => setProfile((p) => ({ ...p, displayName: e.target.value }))}
+            placeholder="Example: Ghost#1942"
+          />
+          <p className="hint">Only this name appears to your stranger.</p>
+
+          <label className="field-label">Gender</label>
+          <div className="chip-wrap">{GENDERS.map((x) => <Chip key={x} label={x} active={profile.gender === x} onClick={() => setProfile((p) => ({ ...p, gender: x }))} />)}</div>
+
+          <label className="field-label">Age group</label>
+          <div className="chip-wrap">{AGE_GROUPS.map((x) => <Chip key={x} label={x} active={profile.ageGroup === x} onClick={() => setProfile((p) => ({ ...p, ageGroup: x }))} />)}</div>
+
+          <label className="field-label">Country</label>
+          <select value={profile.country} onChange={(e) => setProfile((p) => ({ ...p, country: e.target.value }))}>
+            <option value="">Select country</option>
+            {COUNTRIES.map((country) => <option key={country} value={country}>{country}</option>)}
+          </select>
+          <p className="hint">Country is used for matching. City, GPS, IP, and exact location are never shown.</p>
+
+          <label className="field-label">Interests <span>optional</span></label>
+          <div className="chip-wrap">{INTERESTS.map((x) => <Chip key={x} label={x} active={profile.interests.includes(x)} onClick={() => toggleInterest(x)} />)}</div>
+        </div>
+
+        <div className="panel stack-panel">
+          <div className="stat-grid">
+            <div className="stat-card">
+              <span>Realtime server</span>
+              <strong><StatusDot status={status} /> {status}</strong>
+            </div>
+            <div className="stat-card">
+              <span>Online users</span>
+              <strong>{online}</strong>
+            </div>
+            <div className="stat-card">
+              <span>Mode</span>
+              <strong>Text + Games</strong>
+            </div>
+          </div>
+
+          <div className="summary-box">
+            <p className="eyebrow">PUBLIC PREVIEW</p>
+            <h3>{profile.displayName || "No display name"}</h3>
+            <div className="summary-tags">
+              {[profile.gender, profile.ageGroup, profile.country, "Text", ...profile.interests.slice(0, 5)].filter(Boolean).map((x) => <span key={x}>{x}</span>)}
+            </div>
+          </div>
+
+          <div className="safety-box">
+            <p className="eyebrow">FEATURES</p>
+            <ul>
+              <li>Text-only anonymous stranger chat.</li>
+              <li>Image sharing with size and type checks.</li>
+              <li>Interactive Tic-Tac-Toe and Rock Paper Scissors.</li>
+              <li>Skip, end, and report controls are always available.</li>
+            </ul>
+          </div>
+
+          <div className="drive-box">
+            <p className="eyebrow">GOOGLE DRIVE</p>
+            <h3>Not connected</h3>
+            <p>
+              VANISH does not request Drive access. Drive access must only be added later with a clear permission screen and a user-clicked consent button.
+            </p>
+          </div>
+
+          <button className="primary-btn wide" disabled={!valid || status !== "connected"} onClick={onFind}>
+            {status !== "connected" ? "Waiting for backend..." : valid ? "Find a stranger" : "Complete profile first"}
+          </button>
+        </div>
       </div>
-      <p className="hint">Only this name appears to your stranger.</p>
-
-      <label className="field-label">Gender</label>
-      <div className="chip-wrap">{GENDERS.map((x) => <Chip key={x} label={x} active={profile.gender === x} onClick={() => setProfile((p) => ({ ...p, gender: x }))} />)}</div>
-
-      <label className="field-label">Age group</label>
-      <div className="chip-wrap">{AGE_GROUPS.map((x) => <Chip key={x} label={x} active={profile.ageGroup === x} onClick={() => setProfile((p) => ({ ...p, ageGroup: x }))} />)}</div>
-
-      <label className="field-label">Country</label>
-      <select value={profile.country} onChange={(e) => setProfile((p) => ({ ...p, country: e.target.value }))}>
-        <option value="">Select country</option>
-        {COUNTRIES.map((country) => <option key={country} value={country}>{country}</option>)}
-      </select>
-      <p className="hint">VANISH uses country only. It does not show city, GPS, IP, or exact location.</p>
-
-      <label className="field-label">Chat preference</label>
-      <div className="chip-wrap">{CHAT_PREFS.map((x) => <Chip key={x} label={x} active={profile.chatPreference === x} onClick={() => setProfile((p) => ({ ...p, chatPreference: x }))} />)}</div>
-
-      <label className="field-label">Interests <span>optional</span></label>
-      <div className="chip-wrap">{INTERESTS.map((x) => <Chip key={x} label={x} active={profile.interests.includes(x)} onClick={() => toggleInterest(x)} />)}</div>
-
-      <button className="primary-btn wide" disabled={!valid || status !== "connected"} onClick={onFind}>
-        {status !== "connected" ? "Waiting for backend..." : valid ? "Find a stranger" : "Complete profile first"}
-      </button>
     </section>
   );
 }
@@ -145,19 +360,12 @@ function Onboarding({ profile, setProfile, status, online, onFind }) {
 function Matching({ profile, status, onCancel }) {
   return (
     <section className="screen center-screen">
-      <div className="scanner">
-        <span />
-        <span />
-        <span />
-        <div>⌁</div>
-      </div>
+      <div className="scanner"><span /><span /><span /><div>⌁</div></div>
       <p className="eyebrow">MATCHMAKING</p>
       <h2>Looking for a stranger</h2>
-      <p className="hero-copy">Same country is preferred first, then global fallback with the same chat preference.</p>
+      <p className="hero-copy">Same country is preferred first, then VANISH falls back to global text matching.</p>
       <div className="summary-card">
-        {[profile.displayName, profile.gender, profile.ageGroup, profile.country, profile.chatPreference, ...profile.interests.slice(0, 4)].filter(Boolean).map((x) => (
-          <span key={x}>{x}</span>
-        ))}
+        {[profile.displayName, profile.gender, profile.ageGroup, profile.country, "Text", ...profile.interests.slice(0, 4)].filter(Boolean).map((x) => <span key={x}>{x}</span>)}
       </div>
       <button className="secondary-btn" onClick={onCancel}>Cancel</button>
       <p className="connection-line"><StatusDot status={status} /> {status}</p>
@@ -168,522 +376,563 @@ function Matching({ profile, status, onCancel }) {
 function MessageBubble({ message }) {
   if (message.type === "system") return <p className="system-message">— {message.text} —</p>;
   const mine = message.type === "me";
+  const isMedia = message.kind === "media";
+
   return (
     <div className={`message-row ${mine ? "mine" : "theirs"}`}>
-      <div className="message-bubble">{message.text}</div>
+      <div className={`message-bubble ${isMedia ? "media-bubble" : ""}`}>
+        {isMedia ? (
+          <div className="media-message">
+            <img src={message.media.dataUrl} alt={message.media.name || "Shared image"} loading="lazy" />
+            <span>{message.media.name || "Shared image"} • {formatBytes(message.media.size)}</span>
+          </div>
+        ) : message.text}
+      </div>
     </div>
   );
 }
 
-function CallPanel({ callState, callKind, localStream, remoteStream, incomingKind, onStartCall, onAcceptCall, onRejectCall, onHangup, localVideoRef, remoteVideoRef, remoteAudioRef }) {
-  const inCall = ["calling", "voice", "video", "connected"].includes(callState);
-  return (
-    <div className="call-panel">
-      <audio ref={remoteAudioRef} autoPlay playsInline />
-      {callState === "incoming" ? (
-        <div className="incoming-call">
-          <span>Incoming {incomingKind} call</span>
-          <button className="small-btn green" onClick={onAcceptCall}>Accept</button>
-          <button className="small-btn red" onClick={onRejectCall}>Decline</button>
-        </div>
-      ) : inCall ? (
-        <div className="call-active">
-          <div>
-            <strong>{callState === "calling" ? "Calling..." : `${callKind} call active`}</strong>
-            <span>{remoteStream ? "Remote media connected" : "Waiting for remote media"}</span>
-          </div>
-          <button className="small-btn red" onClick={onHangup}>Hang up</button>
-        </div>
-      ) : (
-        <div className="call-buttons">
-          <button className="secondary-btn compact" onClick={() => onStartCall("voice")}>Start voice</button>
-          <button className="secondary-btn compact" onClick={() => onStartCall("video")}>Start video</button>
-        </div>
-      )}
+function winnerLine(board) {
+  const lines = [
+    [0, 1, 2], [3, 4, 5], [6, 7, 8],
+    [0, 3, 6], [1, 4, 7], [2, 5, 8],
+    [0, 4, 8], [2, 4, 6]
+  ];
+  return lines.find(([a, b, c]) => board[a] && board[a] === board[b] && board[a] === board[c]) || [];
+}
 
-      {(localStream || remoteStream) && (
-        <div className="media-grid">
-          <div className="media-box">
-            <video ref={localVideoRef} autoPlay muted playsInline />
-            <span>You</span>
-          </div>
-          <div className="media-box">
-            <video ref={remoteVideoRef} autoPlay playsInline />
-            <span>Stranger</span>
-          </div>
+function TicTacToe({ game, onStart, onMove, onReset }) {
+  const board = game?.board || Array(9).fill(null);
+  const active = Boolean(game?.active);
+  const winning = winnerLine(board);
+
+  let status = "Start a round with your stranger.";
+  if (active) {
+    if (game.winnerSymbol) status = game.winnerSymbol === game.yourSymbol ? "You won this round." : "Stranger won this round.";
+    else if (game.draw) status = "Draw round.";
+    else status = game.isYourTurn ? `Your turn (${game.yourSymbol})` : `Stranger's turn (${game.turnSymbol})`;
+  }
+
+  return (
+    <div className="game-card">
+      <div className="game-title">
+        <div>
+          <strong>Tic-Tac-Toe</strong>
+          <span>{status}</span>
         </div>
-      )}
+        <button className="small-btn" onClick={active ? onReset : onStart}>{active ? "Restart" : "Start"}</button>
+      </div>
+      <div className="ttt-board">
+        {board.map((cell, index) => (
+          <button
+            key={index}
+            className={winning.includes(index) ? "winner" : ""}
+            disabled={!active || !game?.isYourTurn || Boolean(cell) || Boolean(game?.winnerSymbol) || Boolean(game?.draw)}
+            onClick={() => onMove(index)}
+          >
+            {cell || ""}
+          </button>
+        ))}
+      </div>
     </div>
+  );
+}
+
+function RockPaperScissors({ game, onChoose, onReset }) {
+  const choices = ["rock", "paper", "scissors"];
+  const emoji = { rock: "✊", paper: "✋", scissors: "✌️" };
+
+  return (
+    <div className="game-card">
+      <div className="game-title">
+        <div>
+          <strong>Rock Paper Scissors</strong>
+          <span>{game?.result || "Choose one. Result appears after both choose."}</span>
+        </div>
+        <button className="small-btn" onClick={onReset}>New round</button>
+      </div>
+      <div className="rps-grid">
+        {choices.map((choice) => (
+          <button key={choice} className={game?.yourChoice === choice ? "active" : ""} onClick={() => onChoose(choice)}>
+            <span>{emoji[choice]}</span>
+            {choice}
+          </button>
+        ))}
+      </div>
+      <div className="rps-result">
+        <span>You: {game?.yourChoice ? `${emoji[game.yourChoice]} ${game.yourChoice}` : "waiting"}</span>
+        <span>Stranger: {game?.strangerChoice ? `${emoji[game.strangerChoice]} ${game.strangerChoice}` : (game?.strangerReady ? "chosen" : "waiting")}</span>
+      </div>
+      <div className="score-line">Score — You {game?.yourScore || 0} : {game?.strangerScore || 0} Stranger</div>
+    </div>
+  );
+}
+
+function GamePanel({ tttGame, rpsGame, onStartTtt, onMoveTtt, onResetTtt, onRpsChoose, onRpsReset }) {
+  return (
+    <aside className="game-panel">
+      <div className="panel-title compact">
+        <div>
+          <p className="eyebrow">GAMES</p>
+          <h3>Play while chatting</h3>
+        </div>
+      </div>
+      <TicTacToe game={tttGame} onStart={onStartTtt} onMove={onMoveTtt} onReset={onResetTtt} />
+      <RockPaperScissors game={rpsGame} onChoose={onRpsChoose} onReset={onRpsReset} />
+    </aside>
   );
 }
 
 function Chat({
-  profile,
   stranger,
   messages,
   input,
   setInput,
   onSend,
-  onTyping,
+  onMediaSelect,
   onNext,
   onEnd,
   onReport,
-  seconds,
-  bottomRef,
-  status,
-  callProps
+  timer,
+  messagesEndRef,
+  typing,
+  mediaError,
+  tttGame,
+  rpsGame,
+  onStartTtt,
+  onMoveTtt,
+  onResetTtt,
+  onRpsChoose,
+  onRpsReset
 }) {
-  const handleKeyDown = (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      onSend();
-    }
+  const [reportOpen, setReportOpen] = useState(false);
+  const [reason, setReason] = useState("Harassment or abusive behavior");
+  const fileRef = useRef(null);
+
+  const submitReport = () => {
+    onReport(reason);
+    setReportOpen(false);
   };
 
-  const strangerLine = stranger
-    ? [stranger.displayName, stranger.gender, stranger.ageGroup, stranger.country, stranger.chatPreference].filter(Boolean).join(" · ")
-    : "No active stranger";
-
   return (
-    <section className="chat-screen">
-      <header className="chat-header">
-        <div className="avatar">?</div>
-        <div className="chat-title">
-          <strong>Anonymous Stranger</strong>
-          <span>{strangerLine}</span>
+    <section className="chat-shell with-games">
+      <div className="chat-main">
+        <header className="chat-header">
+          <div>
+            <p className="eyebrow">CONNECTED</p>
+            <h2>{stranger?.displayName || "Stranger"}</h2>
+            <p className="muted">
+              {[stranger?.gender, stranger?.ageGroup, stranger?.country, "Text"].filter(Boolean).join(" • ")}
+            </p>
+          </div>
+          <div className="chat-actions">
+            <div className="timer">{formatTime(timer)}</div>
+            <button className="secondary-btn" onClick={onNext}>Next</button>
+            <button className="danger-btn" onClick={onEnd}>End</button>
+          </div>
+        </header>
+
+        <main className="message-list">
+          {messages.map((m) => <MessageBubble key={m.id} message={m} />)}
+          {typing ? <p className="system-message typing-indicator">— Stranger is typing... —</p> : null}
+          <div ref={messagesEndRef} />
+        </main>
+
+        <footer className="composer">
+          <button className="report-btn" onClick={() => setReportOpen((x) => !x)}>Report</button>
+          <button className="secondary-btn attach-btn" type="button" onClick={() => fileRef.current?.click()}>Image</button>
+          <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden onChange={onMediaSelect} />
+          <form onSubmit={onSend} className="composer-form">
+            <input value={input} maxLength={1500} onChange={(e) => setInput(e.target.value)} placeholder="Type a message..." autoFocus />
+            <button className="primary-btn" type="submit">Send</button>
+          </form>
+        </footer>
+        {mediaError ? <p className="media-error">{mediaError}</p> : null}
+      </div>
+
+      <GamePanel
+        tttGame={tttGame}
+        rpsGame={rpsGame}
+        onStartTtt={onStartTtt}
+        onMoveTtt={onMoveTtt}
+        onResetTtt={onResetTtt}
+        onRpsChoose={onRpsChoose}
+        onRpsReset={onRpsReset}
+      />
+
+      {reportOpen ? (
+        <div className="report-modal">
+          <div className="report-card">
+            <h3>Report stranger</h3>
+            <p className="muted">A short temporary evidence snapshot will be saved for moderation.</p>
+            <select value={reason} onChange={(e) => setReason(e.target.value)}>
+              <option>Harassment or abusive behavior</option>
+              <option>Spam or scam</option>
+              <option>Sexual content</option>
+              <option>Hate or threats</option>
+              <option>Other safety issue</option>
+            </select>
+            <div className="modal-actions">
+              <button className="secondary-btn" onClick={() => setReportOpen(false)}>Cancel</button>
+              <button className="danger-btn" onClick={submitReport}>Submit report</button>
+            </div>
+          </div>
         </div>
-        <span className="timer">{formatTime(seconds)}</span>
-        <button className="secondary-btn compact" onClick={onNext}>Next</button>
-        <button className="danger-btn compact" onClick={onEnd}>End</button>
-      </header>
-
-      <div className="privacy-strip"><StatusDot status={status} /> Real-time relay · Your real identity is hidden · Country only</div>
-
-      <CallPanel {...callProps} />
-
-      <main className="messages">
-        {messages.map((message) => <MessageBubble key={message.id} message={message} />)}
-        <div ref={bottomRef} />
-      </main>
-
-      <footer className="composer">
-        <textarea
-          rows={1}
-          value={input}
-          onChange={(e) => {
-            setInput(e.target.value);
-            onTyping(true);
-          }}
-          onKeyDown={handleKeyDown}
-          placeholder={`Message as ${profile.displayName}`}
-        />
-        <button className="primary-btn send-btn" onClick={onSend}>Send</button>
-        <button className="secondary-btn report-btn" onClick={onReport}>Report</button>
-      </footer>
+      ) : null}
     </section>
   );
 }
 
 export default function App() {
-  const wsRef = useRef(null);
-  const reconnectRef = useRef(null);
-  const eventHandlerRef = useRef(null);
-  const bottomRef = useRef(null);
-  const typingStopRef = useRef(null);
-  const timerRef = useRef(null);
-  const pcRef = useRef(null);
-  const localVideoRef = useRef(null);
-  const remoteVideoRef = useRef(null);
-  const remoteAudioRef = useRef(null);
-  const callKindRef = useRef(null);
-
-  const [screen, setScreen] = useState("landing");
+  const [session, setSession] = useState(() => getStoredSession());
   const [status, setStatus] = useState("disconnected");
   const [online, setOnline] = useState(0);
-  const [profile, setProfile] = useState({
+  const [screen, setScreen] = useState(() => getStoredSession() ? "dashboard" : "login");
+  const [profile, setProfile] = useState(() => ({
     displayName: randomAlias(),
     gender: "",
     ageGroup: "",
     country: "",
     chatPreference: "Text",
     interests: []
-  });
+  }));
   const [stranger, setStranger] = useState(null);
   const [roomId, setRoomId] = useState(null);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
-  const [seconds, setSeconds] = useState(0);
-  const [incomingOffer, setIncomingOffer] = useState(null);
-  const [incomingKind, setIncomingKind] = useState(null);
-  const [callState, setCallState] = useState("idle");
-  const [callKind, setCallKind] = useState(null);
-  const [localStream, setLocalStream] = useState(null);
-  const [remoteStream, setRemoteStream] = useState(null);
+  const [timer, setTimer] = useState(0);
+  const [typing, setTyping] = useState(false);
+  const [mediaError, setMediaError] = useState("");
+  const [tttGame, setTttGame] = useState(null);
+  const [rpsGame, setRpsGame] = useState(null);
 
-  const wsUrl = useMemo(() => defaultWsUrl(), []);
+  const wsRef = useRef(null);
+  const roomRef = useRef(null);
+  const messagesEndRef = useRef(null);
+  const typingTimeoutRef = useRef(null);
+  const lastTypingSentRef = useRef(false);
 
-  const addSystem = (text) => setMessages((m) => [...m, { id: crypto.randomUUID(), type: "system", text }]);
-  const addMine = (text) => setMessages((m) => [...m, { id: crypto.randomUUID(), type: "me", text }]);
-  const addTheirs = (text) => setMessages((m) => [...m, { id: crypto.randomUUID(), type: "them", text }]);
+  const sanitizedProfile = useMemo(() => sanitizeProfile(profile), [profile]);
 
-  const wsSend = (type, payload = {}) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type, payload }));
-      return true;
-    }
-    return false;
+  const addSystem = (text) => {
+    setMessages((prev) => [...prev, { id: crypto.randomUUID(), type: "system", text }]);
   };
 
-  const stopTracks = (stream) => {
-    stream?.getTracks?.().forEach((track) => track.stop());
+  const resetRoomState = () => {
+    setTyping(false);
+    setMediaError("");
+    setTttGame(null);
+    setRpsGame(null);
+    lastTypingSentRef.current = false;
   };
 
-  const cleanupCall = (notify = false) => {
-    if (notify) wsSend("webrtc:hangup", { reason: "hangup" });
-    pcRef.current?.close?.();
-    pcRef.current = null;
-    stopTracks(localStream);
-    setLocalStream(null);
-    setRemoteStream(null);
-    setCallState("idle");
-    setCallKind(null);
-    callKindRef.current = null;
-    setIncomingOffer(null);
-    setIncomingKind(null);
+  const sendWs = (type, payload = {}) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(JSON.stringify({ type, payload }));
+    return true;
   };
-
-  const setupPeer = (kind) => {
-    pcRef.current?.close?.();
-    const pc = new RTCPeerConnection({
-      iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
-    });
-
-    pc.onicecandidate = (event) => {
-      if (event.candidate) wsSend("webrtc:ice", { candidate: event.candidate });
-    };
-
-    pc.ontrack = (event) => {
-      const stream = event.streams?.[0];
-      if (stream) setRemoteStream(stream);
-    };
-
-    pc.onconnectionstatechange = () => {
-      if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
-        if (pc.connectionState === "failed") addSystem("Call connection failed. Try again or use TURN in production.");
-      }
-      if (pc.connectionState === "connected") setCallState(kind);
-    };
-
-    pcRef.current = pc;
-    return pc;
-  };
-
-  const getMedia = async (kind) => {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: true,
-      video: kind === "video" ? { width: 640, height: 360 } : false
-    });
-    setLocalStream(stream);
-    return stream;
-  };
-
-  const startCall = async (kind) => {
-    if (!roomId) return addSystem("You need to be matched before starting a call.");
-    if (!navigator.mediaDevices?.getUserMedia) return addSystem("Your browser does not support media devices.");
-    try {
-      callKindRef.current = kind;
-      setCallKind(kind);
-      setCallState("calling");
-      const stream = await getMedia(kind);
-      const pc = setupPeer(kind);
-      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      wsSend("webrtc:offer", { offer, kind });
-      addSystem(`${kind} call request sent.`);
-    } catch (error) {
-      cleanupCall(false);
-      addSystem(`Could not start ${kind} call: ${error.message}`);
-    }
-  };
-
-  const acceptCall = async () => {
-    if (!incomingOffer || !incomingKind) return;
-    try {
-      callKindRef.current = incomingKind;
-      setCallKind(incomingKind);
-      const stream = await getMedia(incomingKind);
-      const pc = setupPeer(incomingKind);
-      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
-      await pc.setRemoteDescription(new RTCSessionDescription(incomingOffer));
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      wsSend("webrtc:answer", { answer });
-      setCallState(incomingKind);
-      setIncomingOffer(null);
-      setIncomingKind(null);
-      addSystem(`${incomingKind} call accepted.`);
-    } catch (error) {
-      cleanupCall(true);
-      addSystem(`Could not accept call: ${error.message}`);
-    }
-  };
-
-  const rejectCall = () => {
-    wsSend("webrtc:hangup", { reason: "declined" });
-    setIncomingOffer(null);
-    setIncomingKind(null);
-    setCallState("idle");
-    addSystem("Call declined.");
-  };
-
-  const handleServerEvent = async (event) => {
-    const { type, payload = {} } = event;
-
-    if (type === "connected") {
-      setOnline(payload.online || 0);
-      return;
-    }
-
-    if (type === "queue:waiting") {
-      setOnline(payload.online || 0);
-      setScreen("matching");
-      return;
-    }
-
-    if (type === "match:found") {
-      cleanupCall(false);
-      setRoomId(payload.roomId);
-      setStranger(payload.stranger);
-      setMessages([{ id: crypto.randomUUID(), type: "system", text: "Connected to a stranger. Say hi." }]);
-      setInput("");
-      setSeconds(0);
-      setScreen("chat");
-      return;
-    }
-
-    if (type === "chat:message") {
-      addTheirs(payload.text);
-      return;
-    }
-
-    if (type === "chat:typing") {
-      if (payload.isTyping) addSystem("Stranger is typing...");
-      return;
-    }
-
-    if (type === "stranger:left") {
-      cleanupCall(false);
-      setRoomId(null);
-      setStranger(null);
-      addSystem(`Stranger ${payload.reason || "left"}.`);
-      return;
-    }
-
-    if (type === "report:received") {
-      addSystem(payload.message || "Report received.");
-      return;
-    }
-
-    if (type === "error") {
-      addSystem(payload.message || "Something went wrong.");
-      return;
-    }
-
-    if (type === "webrtc:offer") {
-      setIncomingOffer(payload.offer);
-      setIncomingKind(payload.kind || "voice");
-      setCallState("incoming");
-      addSystem(`Incoming ${payload.kind || "voice"} call.`);
-      return;
-    }
-
-    if (type === "webrtc:answer") {
-      if (pcRef.current && payload.answer) {
-        await pcRef.current.setRemoteDescription(new RTCSessionDescription(payload.answer));
-        setCallState(callKindRef.current || "connected");
-        addSystem("Call connected.");
-      }
-      return;
-    }
-
-    if (type === "webrtc:ice") {
-      if (pcRef.current && payload.candidate) {
-        try {
-          await pcRef.current.addIceCandidate(new RTCIceCandidate(payload.candidate));
-        } catch {
-          // ICE candidates can arrive before remote description in edge cases; safe to ignore for MVP.
-        }
-      }
-      return;
-    }
-
-    if (type === "webrtc:hangup") {
-      cleanupCall(false);
-      addSystem(`Call ended${payload.reason ? `: ${payload.reason}` : "."}`);
-    }
-  };
-
-  eventHandlerRef.current = handleServerEvent;
 
   useEffect(() => {
-    let manualClose = false;
+    if (!session) return;
 
-    const connect = () => {
+    let closedByEffect = false;
+    let reconnectTimer;
+
+    function connect() {
       setStatus("connecting");
-      const ws = new WebSocket(wsUrl);
+      const ws = new WebSocket(defaultWsUrl(session.sessionToken));
       wsRef.current = ws;
 
-      ws.onopen = () => setStatus("connected");
+      ws.onopen = () => {
+        setStatus("connected");
+      };
+
       ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          eventHandlerRef.current?.(data);
-        } catch {
-          console.warn("Invalid server event", event.data);
+        let msg;
+        try { msg = JSON.parse(event.data); } catch { return; }
+        const payload = msg.payload || {};
+
+        switch (msg.type) {
+          case "server:hello":
+          case "server:stats":
+            setOnline(payload.online || 0);
+            break;
+
+          case "queue:waiting":
+            setOnline(payload.online || online);
+            setScreen("matching");
+            break;
+
+          case "queue:cancelled":
+            setScreen("dashboard");
+            break;
+
+          case "match:found":
+            roomRef.current = payload.roomId;
+            setRoomId(payload.roomId);
+            setStranger(payload.stranger);
+            setMessages([{ id: crypto.randomUUID(), type: "system", text: `Matched with ${payload.stranger?.displayName || "a stranger"}` }]);
+            resetRoomState();
+            setTimer(0);
+            setScreen("chat");
+            break;
+
+          case "chat:message":
+            setTyping(false);
+            setMessages((prev) => [...prev, { id: crypto.randomUUID(), type: "them", kind: "text", text: payload.text }]);
+            break;
+
+          case "chat:media":
+            setTyping(false);
+            setMessages((prev) => [...prev, { id: crypto.randomUUID(), type: "them", kind: "media", media: payload.media }]);
+            break;
+
+          case "chat:typing":
+            setTyping(Boolean(payload.isTyping));
+            break;
+
+          case "game:tictactoe:state":
+            setTttGame(payload.game || null);
+            break;
+
+          case "game:rps:state":
+            setRpsGame(payload.game || null);
+            break;
+
+          case "stranger:left":
+            resetRoomState();
+            roomRef.current = null;
+            setRoomId(null);
+            setStranger(null);
+            addSystem(payload.reason === "skipped" ? "Stranger skipped this chat." : "Stranger left the chat.");
+            setScreen("dashboard");
+            break;
+
+          case "report:received":
+            addSystem(payload.message || "Report received.");
+            break;
+
+          case "error":
+            setMediaError(payload.message || "Something went wrong.");
+            addSystem(payload.message || "Something went wrong.");
+            break;
+
+          default:
+            break;
         }
       };
-      ws.onerror = () => setStatus("disconnected");
+
       ws.onclose = () => {
         setStatus("disconnected");
-        wsRef.current = null;
-        if (!manualClose) reconnectRef.current = setTimeout(connect, 1500);
+        if (!closedByEffect) reconnectTimer = setTimeout(connect, 1500);
       };
-    };
+
+      ws.onerror = () => {
+        setStatus("disconnected");
+      };
+    }
 
     connect();
+
     return () => {
-      manualClose = true;
-      clearTimeout(reconnectRef.current);
-      wsRef.current?.close();
+      closedByEffect = true;
+      clearTimeout(reconnectTimer);
+      if (wsRef.current) wsRef.current.close();
     };
-  }, [wsUrl]);
+  }, [session]);
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+    if (screen !== "chat") return;
+    const interval = setInterval(() => setTimer((t) => t + 1), 1000);
+    return () => clearInterval(interval);
+  }, [screen]);
 
   useEffect(() => {
-    if (screen === "chat") {
-      clearInterval(timerRef.current);
-      timerRef.current = setInterval(() => setSeconds((x) => x + 1), 1000);
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, typing]);
+
+  useEffect(() => {
+    if (screen !== "chat" || !roomRef.current) return;
+    const text = input.trim();
+
+    clearTimeout(typingTimeoutRef.current);
+
+    if (!text) {
+      if (lastTypingSentRef.current) {
+        sendWs("chat:typing", { roomId: roomRef.current, isTyping: false });
+        lastTypingSentRef.current = false;
+      }
+      return;
     }
-    return () => clearInterval(timerRef.current);
-  }, [screen, roomId]);
 
-  useEffect(() => {
-    if (localVideoRef.current) localVideoRef.current.srcObject = localStream || null;
-  }, [localStream]);
+    if (!lastTypingSentRef.current) {
+      sendWs("chat:typing", { roomId: roomRef.current, isTyping: true });
+      lastTypingSentRef.current = true;
+    }
 
-  useEffect(() => {
-    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = remoteStream || null;
-    if (remoteAudioRef.current) remoteAudioRef.current.srcObject = remoteStream || null;
-  }, [remoteStream]);
+    typingTimeoutRef.current = setTimeout(() => {
+      sendWs("chat:typing", { roomId: roomRef.current, isTyping: false });
+      lastTypingSentRef.current = false;
+    }, 900);
 
-  const startOnboarding = () => setScreen("onboard");
+    return () => clearTimeout(typingTimeoutRef.current);
+  }, [input, screen]);
+
+  const handleLogin = (nextSession) => {
+    const normalized = normalizeSession(nextSession);
+    if (!normalized) return;
+    saveSession(normalized);
+    setSession(normalized);
+    setScreen("dashboard");
+  };
+
+  const handleLogout = () => {
+    sendWs("queue:cancel");
+    if (roomRef.current) sendWs("chat:leave", { roomId: roomRef.current });
+    clearStoredSession();
+    setSession(null);
+    setScreen("login");
+    setStatus("disconnected");
+    setRoomId(null);
+    setStranger(null);
+    setMessages([]);
+    resetRoomState();
+    wsRef.current?.close();
+  };
 
   const findStranger = () => {
-    if (status !== "connected") return;
-    const clean = sanitizeProfile(profile);
-    setProfile(clean);
     setMessages([]);
-    setStranger(null);
-    setRoomId(null);
-    setSeconds(0);
-    cleanupCall(false);
-    wsSend("match:find", { profile: clean });
+    resetRoomState();
+    sendWs("match:find", { profile: sanitizedProfile });
     setScreen("matching");
   };
 
   const cancelMatching = () => {
-    wsSend("queue:cancel", {});
-    setScreen("onboard");
+    sendWs("queue:cancel");
+    setScreen("dashboard");
   };
 
-  const sendMessage = () => {
+  const sendMessage = (e) => {
+    e.preventDefault();
     const text = input.trim();
-    if (!text || !roomId) return;
-    if (wsSend("chat:message", { text })) {
-      addMine(text);
-      setInput("");
-      wsSend("chat:typing", { isTyping: false });
-    }
+    if (!text || !roomRef.current) return;
+
+    sendWs("chat:typing", { roomId: roomRef.current, isTyping: false });
+    lastTypingSentRef.current = false;
+    sendWs("chat:message", { roomId: roomRef.current, text });
+    setMessages((prev) => [...prev, { id: crypto.randomUUID(), type: "me", kind: "text", text }]);
+    setInput("");
   };
 
-  const sendTyping = () => {
-    if (!roomId) return;
-    wsSend("chat:typing", { isTyping: true });
-    clearTimeout(typingStopRef.current);
-    typingStopRef.current = setTimeout(() => wsSend("chat:typing", { isTyping: false }), 900);
+  const handleMediaSelect = (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    setMediaError("");
+    if (!file || !roomRef.current) return;
+
+    if (!ALLOWED_MEDIA_TYPES.includes(file.type)) {
+      setMediaError("Only PNG, JPG, WEBP, and GIF images are allowed.");
+      return;
+    }
+
+    if (file.size > MAX_MEDIA_BYTES) {
+      setMediaError(`Image is too large. Maximum size is ${formatBytes(MAX_MEDIA_BYTES)}.`);
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      const media = {
+        dataUrl: String(reader.result || ""),
+        name: file.name.slice(0, 80),
+        mime: file.type,
+        size: file.size
+      };
+      sendWs("chat:media", { roomId: roomRef.current, media });
+      setMessages((prev) => [...prev, { id: crypto.randomUUID(), type: "me", kind: "media", media }]);
+    };
+    reader.onerror = () => setMediaError("Could not read this image.");
+    reader.readAsDataURL(file);
   };
 
   const nextStranger = () => {
-    cleanupCall(true);
-    setMessages([]);
+    resetRoomState();
+    sendWs("match:skip", { roomId });
     setStranger(null);
     setRoomId(null);
-    setSeconds(0);
-    wsSend("match:skip", { profile: sanitizeProfile(profile) });
+    roomRef.current = null;
+    setMessages([]);
+    setTimer(0);
     setScreen("matching");
+    setTimeout(() => sendWs("match:find", { profile: sanitizedProfile }), 80);
   };
 
   const endChat = () => {
-    cleanupCall(true);
-    wsSend("chat:leave", {});
-    setMessages([]);
+    resetRoomState();
+    sendWs("chat:leave", { roomId });
     setStranger(null);
     setRoomId(null);
-    setSeconds(0);
-    setScreen("onboard");
+    roomRef.current = null;
+    setMessages([]);
+    setTimer(0);
+    setScreen("dashboard");
   };
 
-  const reportUser = () => {
-    const reason = window.prompt("Reason for report?", "Harassment or abusive behavior");
-    if (!reason) return;
-    wsSend("report:user", { reason });
+  const report = (reason) => {
+    sendWs("report:user", { roomId, reason });
   };
 
-  const callProps = {
-    callState,
-    callKind,
-    localStream,
-    remoteStream,
-    incomingKind,
-    onStartCall: startCall,
-    onAcceptCall: acceptCall,
-    onRejectCall: rejectCall,
-    onHangup: () => cleanupCall(true),
-    localVideoRef,
-    remoteVideoRef,
-    remoteAudioRef
-  };
+  const startTtt = () => sendWs("game:tictactoe:start", { roomId: roomRef.current });
+  const resetTtt = () => sendWs("game:tictactoe:reset", { roomId: roomRef.current });
+  const moveTtt = (index) => sendWs("game:tictactoe:move", { roomId: roomRef.current, index });
+  const chooseRps = (choice) => sendWs("game:rps:choose", { roomId: roomRef.current, choice });
+  const resetRps = () => sendWs("game:rps:reset", { roomId: roomRef.current });
+
+  if (!session || screen === "login") {
+    return <LoginScreen onLogin={handleLogin} />;
+  }
+
+  if (screen === "matching") {
+    return <Matching profile={sanitizedProfile} status={status} onCancel={cancelMatching} />;
+  }
+
+  if (screen === "chat") {
+    return (
+      <Chat
+        stranger={stranger}
+        messages={messages}
+        input={input}
+        setInput={setInput}
+        onSend={sendMessage}
+        onMediaSelect={handleMediaSelect}
+        onNext={nextStranger}
+        onEnd={endChat}
+        onReport={report}
+        timer={timer}
+        messagesEndRef={messagesEndRef}
+        typing={typing}
+        mediaError={mediaError}
+        tttGame={tttGame}
+        rpsGame={rpsGame}
+        onStartTtt={startTtt}
+        onMoveTtt={moveTtt}
+        onResetTtt={resetTtt}
+        onRpsChoose={chooseRps}
+        onRpsReset={resetRps}
+      />
+    );
+  }
 
   return (
-    <div className="app-shell">
-      <div className="grid-bg" />
-      <div className="app-container">
-        {screen === "landing" && <Landing status={status} onStart={startOnboarding} />}
-        {screen === "onboard" && <Onboarding profile={profile} setProfile={setProfile} status={status} online={online} onFind={findStranger} />}
-        {screen === "matching" && <Matching profile={profile} status={status} onCancel={cancelMatching} />}
-        {screen === "chat" && (
-          <Chat
-            profile={profile}
-            stranger={stranger}
-            messages={messages}
-            input={input}
-            setInput={setInput}
-            onSend={sendMessage}
-            onTyping={sendTyping}
-            onNext={nextStranger}
-            onEnd={endChat}
-            onReport={reportUser}
-            seconds={seconds}
-            bottomRef={bottomRef}
-            status={status}
-            callProps={callProps}
-          />
-        )}
-      </div>
-    </div>
+    <Dashboard
+      account={session.user}
+      profile={profile}
+      setProfile={setProfile}
+      status={status}
+      online={online}
+      onFind={findStranger}
+      onLogout={handleLogout}
+    />
   );
 }
