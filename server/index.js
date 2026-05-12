@@ -10,7 +10,9 @@ const PORT = Number(process.env.PORT || 3001);
 const CLIENT_DIST = path.resolve(__dirname, "../client/dist");
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || process.env.VITE_GOOGLE_CLIENT_ID || "";
 const MAX_MESSAGE_LENGTH = 1500;
+const MAX_MEDIA_BYTES = 1_000_000;
 const MESSAGE_RATE_LIMIT = { max: 12, windowMs: 10_000 };
+const MEDIA_RATE_LIMIT = { max: 4, windowMs: 30_000 };
 const QUEUE_TIMEOUT_MS = 5 * 60 * 1000;
 
 const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null;
@@ -185,7 +187,15 @@ function createRoom(a, b) {
     b,
     mode: "Text",
     createdAt: now(),
-    buffer: []
+    buffer: [],
+    games: {
+      tictactoe: null,
+      rps: {
+        choices: {},
+        scores: { [a.id]: 0, [b.id]: 0 },
+        lastResult: null
+      }
+    }
   };
   rooms.set(roomId, room);
 
@@ -204,6 +214,8 @@ function createRoom(a, b) {
     stranger: safeProfile(a.profile),
     initiator: false
   });
+
+  sendRpsState(room);
 }
 
 function joinQueue(client, profile) {
@@ -251,12 +263,20 @@ function leaveRoom(client, reason = "left") {
   }
 }
 
-function rateLimited(client) {
+function limited(client, key, limit) {
   const current = now();
-  client.messageHits = client.messageHits.filter((t) => current - t < MESSAGE_RATE_LIMIT.windowMs);
-  if (client.messageHits.length >= MESSAGE_RATE_LIMIT.max) return true;
-  client.messageHits.push(current);
+  client[key] = client[key].filter((t) => current - t < limit.windowMs);
+  if (client[key].length >= limit.max) return true;
+  client[key].push(current);
   return false;
+}
+
+function rateLimited(client) {
+  return limited(client, "messageHits", MESSAGE_RATE_LIMIT);
+}
+
+function mediaRateLimited(client) {
+  return limited(client, "mediaHits", MEDIA_RATE_LIMIT);
 }
 
 function relayChat(client, rawText) {
@@ -270,12 +290,58 @@ function relayChat(client, rawText) {
   const other = otherClient(room, client);
   if (!other) return;
 
-  room.buffer.push({ from: client.id, text, ts: now() });
+  room.buffer.push({ kind: "text", from: client.id, text, ts: now() });
   if (room.buffer.length > 20) room.buffer.shift();
 
   client.typingState = false;
   send(other.ws, "chat:typing", { isTyping: false });
   send(other.ws, "chat:message", { text });
+}
+
+function validateMedia(rawMedia = {}) {
+  const dataUrl = String(rawMedia.dataUrl || "");
+  const mime = String(rawMedia.mime || "").toLowerCase();
+  const name = String(rawMedia.name || "shared-image").replace(/[<>]/g, "").slice(0, 80);
+  const size = Number(rawMedia.size || 0);
+  const allowed = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+
+  if (!allowed.has(mime)) return { error: "Only PNG, JPG, WEBP, and GIF images are allowed." };
+  if (!dataUrl.startsWith(`data:${mime};base64,`)) return { error: "Invalid image data." };
+
+  const base64 = dataUrl.split(",")[1] || "";
+  if (!/^[a-z0-9+/=]+$/i.test(base64)) return { error: "Invalid image encoding." };
+
+  const bytes = Math.floor((base64.length * 3) / 4) - (base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0);
+  if (bytes <= 0 || bytes > MAX_MEDIA_BYTES || size > MAX_MEDIA_BYTES) {
+    return { error: "Image is too large. Maximum size is 1 MB." };
+  }
+
+  return { media: { dataUrl, mime, name, size: bytes } };
+}
+
+function relayMedia(client, rawMedia) {
+  const room = rooms.get(client.roomId);
+  if (!room) return sendError(client.ws, "You are not connected to a stranger.");
+  if (mediaRateLimited(client)) return sendError(client.ws, "You are sending images too fast.");
+
+  const result = validateMedia(rawMedia);
+  if (result.error) return sendError(client.ws, result.error);
+
+  const other = otherClient(room, client);
+  if (!other) return;
+
+  const media = result.media;
+  room.buffer.push({
+    kind: "media",
+    from: client.id,
+    media: { name: media.name, mime: media.mime, size: media.size },
+    ts: now()
+  });
+  if (room.buffer.length > 20) room.buffer.shift();
+
+  client.typingState = false;
+  send(other.ws, "chat:typing", { isTyping: false });
+  send(other.ws, "chat:media", { media });
 }
 
 function relayTyping(client, isTyping) {
@@ -313,6 +379,160 @@ function reportUser(client, reason) {
   });
 }
 
+function checkTicTacToeWinner(board) {
+  const lines = [
+    [0, 1, 2], [3, 4, 5], [6, 7, 8],
+    [0, 3, 6], [1, 4, 7], [2, 5, 8],
+    [0, 4, 8], [2, 4, 6]
+  ];
+  for (const [a, b, c] of lines) {
+    if (board[a] && board[a] === board[b] && board[a] === board[c]) return board[a];
+  }
+  return null;
+}
+
+function tttView(room, client) {
+  const game = room.games.tictactoe;
+  if (!game) return null;
+  const yourSymbol = game.symbols[client.id];
+  const stranger = otherClient(room, client);
+  const strangerSymbol = stranger ? game.symbols[stranger.id] : null;
+  const turnSymbol = game.turn ? game.symbols[game.turn] : null;
+  return {
+    active: true,
+    board: game.board,
+    yourSymbol,
+    strangerSymbol,
+    turnSymbol,
+    isYourTurn: game.turn === client.id && !game.winnerSymbol && !game.draw,
+    winnerSymbol: game.winnerSymbol,
+    draw: game.draw
+  };
+}
+
+function sendTttState(room) {
+  send(room.a.ws, "game:tictactoe:state", { game: tttView(room, room.a) });
+  send(room.b.ws, "game:tictactoe:state", { game: tttView(room, room.b) });
+}
+
+function startTicTacToe(client) {
+  const room = rooms.get(client.roomId);
+  if (!room) return sendError(client.ws, "There is no active room.");
+  const other = otherClient(room, client);
+  if (!other) return sendError(client.ws, "There is no stranger in this room.");
+
+  room.games.tictactoe = {
+    board: Array(9).fill(null),
+    turn: client.id,
+    symbols: { [client.id]: "X", [other.id]: "O" },
+    winnerSymbol: null,
+    draw: false,
+    startedAt: now()
+  };
+
+  room.buffer.push({ kind: "game", from: client.id, text: "Started Tic-Tac-Toe.", ts: now() });
+  if (room.buffer.length > 20) room.buffer.shift();
+  sendTttState(room);
+}
+
+function moveTicTacToe(client, rawIndex) {
+  const room = rooms.get(client.roomId);
+  if (!room?.games?.tictactoe) return sendError(client.ws, "Start Tic-Tac-Toe first.");
+  const game = room.games.tictactoe;
+  const index = Number(rawIndex);
+
+  if (!Number.isInteger(index) || index < 0 || index > 8) return sendError(client.ws, "Invalid move.");
+  if (game.winnerSymbol || game.draw) return sendError(client.ws, "This round is already over.");
+  if (game.turn !== client.id) return sendError(client.ws, "It is not your turn.");
+  if (game.board[index]) return sendError(client.ws, "That box is already taken.");
+
+  game.board[index] = game.symbols[client.id];
+  game.winnerSymbol = checkTicTacToeWinner(game.board);
+  game.draw = !game.winnerSymbol && game.board.every(Boolean);
+
+  if (!game.winnerSymbol && !game.draw) {
+    const other = otherClient(room, client);
+    game.turn = other.id;
+  }
+
+  sendTttState(room);
+}
+
+function resetTicTacToe(client) {
+  startTicTacToe(client);
+}
+
+function rpsWinner(a, b) {
+  if (a === b) return "draw";
+  if ((a === "rock" && b === "scissors") || (a === "paper" && b === "rock") || (a === "scissors" && b === "paper")) return "a";
+  return "b";
+}
+
+function rpsView(room, client) {
+  if (!room.games.rps) {
+    room.games.rps = { choices: {}, scores: { [room.a.id]: 0, [room.b.id]: 0 }, lastResult: null };
+  }
+  const game = room.games.rps;
+  const other = otherClient(room, client);
+  const bothChosen = Boolean(game.choices[client.id] && other && game.choices[other.id]);
+  const result = bothChosen ? game.lastResult?.[client.id] || "Round complete." : "Choose one. Result appears after both choose.";
+  return {
+    yourChoice: game.choices[client.id] || "",
+    strangerChoice: bothChosen && other ? game.choices[other.id] || "" : "",
+    strangerReady: Boolean(other && game.choices[other.id]),
+    result,
+    yourScore: game.scores[client.id] || 0,
+    strangerScore: other ? game.scores[other.id] || 0 : 0
+  };
+}
+
+function sendRpsState(room) {
+  send(room.a.ws, "game:rps:state", { game: rpsView(room, room.a) });
+  send(room.b.ws, "game:rps:state", { game: rpsView(room, room.b) });
+}
+
+function chooseRps(client, choice) {
+  const room = rooms.get(client.roomId);
+  if (!room) return sendError(client.ws, "There is no active room.");
+
+  const safeChoice = String(choice || "").toLowerCase();
+  if (!["rock", "paper", "scissors"].includes(safeChoice)) return sendError(client.ws, "Invalid choice.");
+
+  if (!room.games.rps) {
+    room.games.rps = { choices: {}, scores: { [room.a.id]: 0, [room.b.id]: 0 }, lastResult: null };
+  }
+
+  const game = room.games.rps;
+  const other = otherClient(room, client);
+  if (!other) return sendError(client.ws, "There is no stranger in this room.");
+
+  game.choices[client.id] = safeChoice;
+
+  if (game.choices[room.a.id] && game.choices[room.b.id]) {
+    const outcome = rpsWinner(game.choices[room.a.id], game.choices[room.b.id]);
+    if (outcome === "draw") {
+      game.lastResult = { [room.a.id]: "Draw round.", [room.b.id]: "Draw round." };
+    } else {
+      const winner = outcome === "a" ? room.a : room.b;
+      const loser = outcome === "a" ? room.b : room.a;
+      game.scores[winner.id] = (game.scores[winner.id] || 0) + 1;
+      game.lastResult = { [winner.id]: "You won this round.", [loser.id]: "Stranger won this round." };
+    }
+  } else {
+    game.lastResult = null;
+  }
+
+  sendRpsState(room);
+}
+
+function resetRps(client) {
+  const room = rooms.get(client.roomId);
+  if (!room) return sendError(client.ws, "There is no active room.");
+  const scores = room.games.rps?.scores || { [room.a.id]: 0, [room.b.id]: 0 };
+  room.games.rps = { choices: {}, scores, lastResult: null };
+  sendRpsState(room);
+}
+
 function handleMessage(client, raw) {
   let msg;
   try {
@@ -344,6 +564,10 @@ function handleMessage(client, raw) {
       relayChat(client, payload.text);
       break;
 
+    case "chat:media":
+      relayMedia(client, payload.media);
+      break;
+
     case "chat:typing":
       relayTyping(client, payload.isTyping);
       break;
@@ -358,6 +582,26 @@ function handleMessage(client, raw) {
 
     case "report:user":
       reportUser(client, payload.reason);
+      break;
+
+    case "game:tictactoe:start":
+      startTicTacToe(client);
+      break;
+
+    case "game:tictactoe:reset":
+      resetTicTacToe(client);
+      break;
+
+    case "game:tictactoe:move":
+      moveTicTacToe(client, payload.index);
+      break;
+
+    case "game:rps:choose":
+      chooseRps(client, payload.choice);
+      break;
+
+    case "game:rps:reset":
+      resetRps(client);
       break;
 
     default:
@@ -378,7 +622,9 @@ function serveStatic(req, res) {
       online: clients.size,
       rooms: rooms.size,
       waiting: waiting.length,
-      googleAuthConfigured: Boolean(GOOGLE_CLIENT_ID)
+      reports: reports.length,
+      googleAuthConfigured: Boolean(GOOGLE_CLIENT_ID),
+      features: ["text-chat", "image-sharing", "tic-tac-toe", "rock-paper-scissors"]
     });
   }
 
@@ -423,7 +669,7 @@ function serveStatic(req, res) {
 }
 
 const server = http.createServer(serveStatic);
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({ server, maxPayload: 2 * 1024 * 1024 });
 
 wss.on("connection", (ws, req) => {
   const parsed = new URL(req.url, `http://${req.headers.host}`);
@@ -439,6 +685,7 @@ wss.on("connection", (ws, req) => {
     state: "idle",
     queuedAt: null,
     messageHits: [],
+    mediaHits: [],
     typingState: false,
     connectedAt: now()
   };

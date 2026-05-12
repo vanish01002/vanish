@@ -12,6 +12,8 @@ const COUNTRIES = [
 ];
 const ALIASES = ["Cipher", "Ghost", "Nova", "Echo", "Raven", "Drift", "Myst", "Void", "Astra", "Pixel", "Orbit", "Frost"];
 const STORAGE_KEY = "vanish_session_v2";
+const MAX_MEDIA_BYTES = 1_000_000;
+const ALLOWED_MEDIA_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
 
 function randomAlias() {
   const base = ALIASES[Math.floor(Math.random() * ALIASES.length)];
@@ -75,6 +77,12 @@ function formatTime(sec) {
   const m = Math.floor(sec / 60).toString().padStart(2, "0");
   const s = (sec % 60).toString().padStart(2, "0");
   return `${m}:${s}`;
+}
+
+function formatBytes(bytes = 0) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function StatusDot({ status }) {
@@ -203,7 +211,7 @@ function LoginScreen({ onLogin }) {
       </div>
 
       <div className="privacy-note">
-        <strong>Privacy rule:</strong> your Google name and email stay in your account dashboard. Strangers only see your display name, gender, age group, country, and interests.
+        <strong>Privacy rule:</strong> your Google name and email stay in your account dashboard. Strangers only see your display name, gender, age group, country, interests, chat messages, game moves, and images you manually send.
       </div>
     </section>
   );
@@ -286,8 +294,8 @@ function Dashboard({ account, profile, setProfile, status, online, onFind, onLog
               <strong>{online}</strong>
             </div>
             <div className="stat-card">
-              <span>Chat mode</span>
-              <strong>Text only</strong>
+              <span>Mode</span>
+              <strong>Text + Games</strong>
             </div>
           </div>
 
@@ -300,12 +308,12 @@ function Dashboard({ account, profile, setProfile, status, online, onFind, onLog
           </div>
 
           <div className="safety-box">
-            <p className="eyebrow">SAFETY</p>
+            <p className="eyebrow">FEATURES</p>
             <ul>
-              <li>No audio/video call permissions.</li>
-              <li>No stranger can see your Google account.</li>
-              <li>Report saves only a short temporary evidence snapshot.</li>
-              <li>Skip and end chat are always available.</li>
+              <li>Text-only anonymous stranger chat.</li>
+              <li>Image sharing with size and type checks.</li>
+              <li>Interactive Tic-Tac-Toe and Rock Paper Scissors.</li>
+              <li>Skip, end, and report controls are always available.</li>
             </ul>
           </div>
 
@@ -345,16 +353,138 @@ function Matching({ profile, status, onCancel }) {
 function MessageBubble({ message }) {
   if (message.type === "system") return <p className="system-message">— {message.text} —</p>;
   const mine = message.type === "me";
+  const isMedia = message.kind === "media";
+
   return (
     <div className={`message-row ${mine ? "mine" : "theirs"}`}>
-      <div className="message-bubble">{message.text}</div>
+      <div className={`message-bubble ${isMedia ? "media-bubble" : ""}`}>
+        {isMedia ? (
+          <div className="media-message">
+            <img src={message.media.dataUrl} alt={message.media.name || "Shared image"} loading="lazy" />
+            <span>{message.media.name || "Shared image"} • {formatBytes(message.media.size)}</span>
+          </div>
+        ) : message.text}
+      </div>
     </div>
   );
 }
 
-function Chat({ profile, stranger, messages, input, setInput, onSend, onNext, onEnd, onReport, timer, messagesEndRef, typing }) {
+function winnerLine(board) {
+  const lines = [
+    [0, 1, 2], [3, 4, 5], [6, 7, 8],
+    [0, 3, 6], [1, 4, 7], [2, 5, 8],
+    [0, 4, 8], [2, 4, 6]
+  ];
+  return lines.find(([a, b, c]) => board[a] && board[a] === board[b] && board[a] === board[c]) || [];
+}
+
+function TicTacToe({ game, onStart, onMove, onReset }) {
+  const board = game?.board || Array(9).fill(null);
+  const active = Boolean(game?.active);
+  const winning = winnerLine(board);
+
+  let status = "Start a round with your stranger.";
+  if (active) {
+    if (game.winnerSymbol) status = game.winnerSymbol === game.yourSymbol ? "You won this round." : "Stranger won this round.";
+    else if (game.draw) status = "Draw round.";
+    else status = game.isYourTurn ? `Your turn (${game.yourSymbol})` : `Stranger's turn (${game.turnSymbol})`;
+  }
+
+  return (
+    <div className="game-card">
+      <div className="game-title">
+        <div>
+          <strong>Tic-Tac-Toe</strong>
+          <span>{status}</span>
+        </div>
+        <button className="small-btn" onClick={active ? onReset : onStart}>{active ? "Restart" : "Start"}</button>
+      </div>
+      <div className="ttt-board">
+        {board.map((cell, index) => (
+          <button
+            key={index}
+            className={winning.includes(index) ? "winner" : ""}
+            disabled={!active || !game?.isYourTurn || Boolean(cell) || Boolean(game?.winnerSymbol) || Boolean(game?.draw)}
+            onClick={() => onMove(index)}
+          >
+            {cell || ""}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function RockPaperScissors({ game, onChoose, onReset }) {
+  const choices = ["rock", "paper", "scissors"];
+  const emoji = { rock: "✊", paper: "✋", scissors: "✌️" };
+
+  return (
+    <div className="game-card">
+      <div className="game-title">
+        <div>
+          <strong>Rock Paper Scissors</strong>
+          <span>{game?.result || "Choose one. Result appears after both choose."}</span>
+        </div>
+        <button className="small-btn" onClick={onReset}>New round</button>
+      </div>
+      <div className="rps-grid">
+        {choices.map((choice) => (
+          <button key={choice} className={game?.yourChoice === choice ? "active" : ""} onClick={() => onChoose(choice)}>
+            <span>{emoji[choice]}</span>
+            {choice}
+          </button>
+        ))}
+      </div>
+      <div className="rps-result">
+        <span>You: {game?.yourChoice ? `${emoji[game.yourChoice]} ${game.yourChoice}` : "waiting"}</span>
+        <span>Stranger: {game?.strangerChoice ? `${emoji[game.strangerChoice]} ${game.strangerChoice}` : (game?.strangerReady ? "chosen" : "waiting")}</span>
+      </div>
+      <div className="score-line">Score — You {game?.yourScore || 0} : {game?.strangerScore || 0} Stranger</div>
+    </div>
+  );
+}
+
+function GamePanel({ tttGame, rpsGame, onStartTtt, onMoveTtt, onResetTtt, onRpsChoose, onRpsReset }) {
+  return (
+    <aside className="game-panel">
+      <div className="panel-title compact">
+        <div>
+          <p className="eyebrow">GAMES</p>
+          <h3>Play while chatting</h3>
+        </div>
+      </div>
+      <TicTacToe game={tttGame} onStart={onStartTtt} onMove={onMoveTtt} onReset={onResetTtt} />
+      <RockPaperScissors game={rpsGame} onChoose={onRpsChoose} onReset={onRpsReset} />
+    </aside>
+  );
+}
+
+function Chat({
+  stranger,
+  messages,
+  input,
+  setInput,
+  onSend,
+  onMediaSelect,
+  onNext,
+  onEnd,
+  onReport,
+  timer,
+  messagesEndRef,
+  typing,
+  mediaError,
+  tttGame,
+  rpsGame,
+  onStartTtt,
+  onMoveTtt,
+  onResetTtt,
+  onRpsChoose,
+  onRpsReset
+}) {
   const [reportOpen, setReportOpen] = useState(false);
   const [reason, setReason] = useState("Harassment or abusive behavior");
+  const fileRef = useRef(null);
 
   const submitReport = () => {
     onReport(reason);
@@ -362,35 +492,50 @@ function Chat({ profile, stranger, messages, input, setInput, onSend, onNext, on
   };
 
   return (
-    <section className="chat-shell">
-      <header className="chat-header">
-        <div>
-          <p className="eyebrow">CONNECTED</p>
-          <h2>{stranger?.displayName || "Stranger"}</h2>
-          <p className="muted">
-            {[stranger?.gender, stranger?.ageGroup, stranger?.country, "Text"].filter(Boolean).join(" • ")}
-          </p>
-        </div>
-        <div className="chat-actions">
-          <div className="timer">{formatTime(timer)}</div>
-          <button className="secondary-btn" onClick={onNext}>Next</button>
-          <button className="danger-btn" onClick={onEnd}>End</button>
-        </div>
-      </header>
+    <section className="chat-shell with-games">
+      <div className="chat-main">
+        <header className="chat-header">
+          <div>
+            <p className="eyebrow">CONNECTED</p>
+            <h2>{stranger?.displayName || "Stranger"}</h2>
+            <p className="muted">
+              {[stranger?.gender, stranger?.ageGroup, stranger?.country, "Text"].filter(Boolean).join(" • ")}
+            </p>
+          </div>
+          <div className="chat-actions">
+            <div className="timer">{formatTime(timer)}</div>
+            <button className="secondary-btn" onClick={onNext}>Next</button>
+            <button className="danger-btn" onClick={onEnd}>End</button>
+          </div>
+        </header>
 
-      <main className="message-list">
-        {messages.map((m) => <MessageBubble key={m.id} message={m} />)}
-        {typing ? <p className="system-message typing-indicator">— Stranger is typing... —</p> : null}
-        <div ref={messagesEndRef} />
-      </main>
+        <main className="message-list">
+          {messages.map((m) => <MessageBubble key={m.id} message={m} />)}
+          {typing ? <p className="system-message typing-indicator">— Stranger is typing... —</p> : null}
+          <div ref={messagesEndRef} />
+        </main>
 
-      <footer className="composer">
-        <button className="report-btn" onClick={() => setReportOpen((x) => !x)}>Report</button>
-        <form onSubmit={onSend} className="composer-form">
-          <input value={input} maxLength={1500} onChange={(e) => setInput(e.target.value)} placeholder="Type a message..." autoFocus />
-          <button className="primary-btn" type="submit">Send</button>
-        </form>
-      </footer>
+        <footer className="composer">
+          <button className="report-btn" onClick={() => setReportOpen((x) => !x)}>Report</button>
+          <button className="secondary-btn attach-btn" type="button" onClick={() => fileRef.current?.click()}>Image</button>
+          <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden onChange={onMediaSelect} />
+          <form onSubmit={onSend} className="composer-form">
+            <input value={input} maxLength={1500} onChange={(e) => setInput(e.target.value)} placeholder="Type a message..." autoFocus />
+            <button className="primary-btn" type="submit">Send</button>
+          </form>
+        </footer>
+        {mediaError ? <p className="media-error">{mediaError}</p> : null}
+      </div>
+
+      <GamePanel
+        tttGame={tttGame}
+        rpsGame={rpsGame}
+        onStartTtt={onStartTtt}
+        onMoveTtt={onMoveTtt}
+        onResetTtt={onResetTtt}
+        onRpsChoose={onRpsChoose}
+        onRpsReset={onRpsReset}
+      />
 
       {reportOpen ? (
         <div className="report-modal">
@@ -434,6 +579,9 @@ export default function App() {
   const [input, setInput] = useState("");
   const [timer, setTimer] = useState(0);
   const [typing, setTyping] = useState(false);
+  const [mediaError, setMediaError] = useState("");
+  const [tttGame, setTttGame] = useState(null);
+  const [rpsGame, setRpsGame] = useState(null);
 
   const wsRef = useRef(null);
   const roomRef = useRef(null);
@@ -445,6 +593,14 @@ export default function App() {
 
   const addSystem = (text) => {
     setMessages((prev) => [...prev, { id: crypto.randomUUID(), type: "system", text }]);
+  };
+
+  const resetRoomState = () => {
+    setTyping(false);
+    setMediaError("");
+    setTttGame(null);
+    setRpsGame(null);
+    lastTypingSentRef.current = false;
   };
 
   const sendWs = (type, payload = {}) => {
@@ -494,23 +650,35 @@ export default function App() {
             setRoomId(payload.roomId);
             setStranger(payload.stranger);
             setMessages([{ id: crypto.randomUUID(), type: "system", text: `Matched with ${payload.stranger?.displayName || "a stranger"}` }]);
-            setTyping(false);
-            lastTypingSentRef.current = false;
+            resetRoomState();
             setTimer(0);
             setScreen("chat");
             break;
 
           case "chat:message":
             setTyping(false);
-            setMessages((prev) => [...prev, { id: crypto.randomUUID(), type: "them", text: payload.text }]);
+            setMessages((prev) => [...prev, { id: crypto.randomUUID(), type: "them", kind: "text", text: payload.text }]);
+            break;
+
+          case "chat:media":
+            setTyping(false);
+            setMessages((prev) => [...prev, { id: crypto.randomUUID(), type: "them", kind: "media", media: payload.media }]);
             break;
 
           case "chat:typing":
             setTyping(Boolean(payload.isTyping));
             break;
 
+          case "game:tictactoe:state":
+            setTttGame(payload.game || null);
+            break;
+
+          case "game:rps:state":
+            setRpsGame(payload.game || null);
+            break;
+
           case "stranger:left":
-            setTyping(false);
+            resetRoomState();
             roomRef.current = null;
             setRoomId(null);
             setStranger(null);
@@ -523,6 +691,7 @@ export default function App() {
             break;
 
           case "error":
+            setMediaError(payload.message || "Something went wrong.");
             addSystem(payload.message || "Something went wrong.");
             break;
 
@@ -602,12 +771,13 @@ export default function App() {
     setRoomId(null);
     setStranger(null);
     setMessages([]);
+    resetRoomState();
     wsRef.current?.close();
   };
 
   const findStranger = () => {
     setMessages([]);
-    setTyping(false);
+    resetRoomState();
     sendWs("match:find", { profile: sanitizedProfile });
     setScreen("matching");
   };
@@ -625,12 +795,43 @@ export default function App() {
     sendWs("chat:typing", { roomId: roomRef.current, isTyping: false });
     lastTypingSentRef.current = false;
     sendWs("chat:message", { roomId: roomRef.current, text });
-    setMessages((prev) => [...prev, { id: crypto.randomUUID(), type: "me", text }]);
+    setMessages((prev) => [...prev, { id: crypto.randomUUID(), type: "me", kind: "text", text }]);
     setInput("");
   };
 
+  const handleMediaSelect = (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    setMediaError("");
+    if (!file || !roomRef.current) return;
+
+    if (!ALLOWED_MEDIA_TYPES.includes(file.type)) {
+      setMediaError("Only PNG, JPG, WEBP, and GIF images are allowed.");
+      return;
+    }
+
+    if (file.size > MAX_MEDIA_BYTES) {
+      setMediaError(`Image is too large. Maximum size is ${formatBytes(MAX_MEDIA_BYTES)}.`);
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      const media = {
+        dataUrl: String(reader.result || ""),
+        name: file.name.slice(0, 80),
+        mime: file.type,
+        size: file.size
+      };
+      sendWs("chat:media", { roomId: roomRef.current, media });
+      setMessages((prev) => [...prev, { id: crypto.randomUUID(), type: "me", kind: "media", media }]);
+    };
+    reader.onerror = () => setMediaError("Could not read this image.");
+    reader.readAsDataURL(file);
+  };
+
   const nextStranger = () => {
-    setTyping(false);
+    resetRoomState();
     sendWs("match:skip", { roomId });
     setStranger(null);
     setRoomId(null);
@@ -642,7 +843,7 @@ export default function App() {
   };
 
   const endChat = () => {
-    setTyping(false);
+    resetRoomState();
     sendWs("chat:leave", { roomId });
     setStranger(null);
     setRoomId(null);
@@ -656,6 +857,12 @@ export default function App() {
     sendWs("report:user", { roomId, reason });
   };
 
+  const startTtt = () => sendWs("game:tictactoe:start", { roomId: roomRef.current });
+  const resetTtt = () => sendWs("game:tictactoe:reset", { roomId: roomRef.current });
+  const moveTtt = (index) => sendWs("game:tictactoe:move", { roomId: roomRef.current, index });
+  const chooseRps = (choice) => sendWs("game:rps:choose", { roomId: roomRef.current, choice });
+  const resetRps = () => sendWs("game:rps:reset", { roomId: roomRef.current });
+
   if (!session || screen === "login") {
     return <LoginScreen onLogin={handleLogin} />;
   }
@@ -667,18 +874,26 @@ export default function App() {
   if (screen === "chat") {
     return (
       <Chat
-        profile={sanitizedProfile}
         stranger={stranger}
         messages={messages}
         input={input}
         setInput={setInput}
         onSend={sendMessage}
+        onMediaSelect={handleMediaSelect}
         onNext={nextStranger}
         onEnd={endChat}
         onReport={report}
         timer={timer}
         messagesEndRef={messagesEndRef}
         typing={typing}
+        mediaError={mediaError}
+        tttGame={tttGame}
+        rpsGame={rpsGame}
+        onStartTtt={startTtt}
+        onMoveTtt={moveTtt}
+        onResetTtt={resetTtt}
+        onRpsChoose={chooseRps}
+        onRpsReset={resetRps}
       />
     );
   }

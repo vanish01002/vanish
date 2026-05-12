@@ -1,14 +1,23 @@
 # VANISH
 
-Anonymous text-only stranger chat with a Google account dashboard.
+Anonymous text-only stranger chat with a Google account dashboard, image sharing, and interactive games.
 
-## Changes in this version
+## Current features
 
-- Removed audio and video calls.
-- Added account login using Google Identity Services.
-- Added a dashboard with account info, anonymous profile editor, server status, safety notes, and match button.
-- Google account details are never shown to strangers.
-- Google Drive access is not requested.
+- Google account login through Google Identity Services.
+- Guest mode for testing.
+- Account dashboard.
+- Anonymous public profile: display name, gender, age group, country, interests.
+- Real stranger matching through WebSocket.
+- Text-only anonymous chat.
+- Image sharing: PNG, JPG, WEBP, and GIF only; maximum 1 MB per image.
+- Interactive games inside chat:
+  - Tic-Tac-Toe
+  - Rock Paper Scissors
+- Typing indicator.
+- Skip, end chat, and report controls.
+- No audio/video calls.
+- No Google Drive access.
 
 ## Render build command
 
@@ -33,36 +42,39 @@ NODE_VERSION=20
 NODE_ENV=production
 ```
 
-## Google OAuth setup
+If Google login is not configured, guest mode still works for testing.
 
-In Google Cloud Console:
+## Local run
 
-1. Create OAuth consent screen.
-2. Create OAuth Client ID, type Web application.
-3. Add authorized JavaScript origin:
-
-```text
-https://your-render-service.onrender.com
-```
-
-4. Add authorized redirect URI if Google asks for one:
-
-```text
-https://your-render-service.onrender.com
-```
-
-## Run locally
+Terminal 1:
 
 ```bash
-npm --prefix client install
 npm --prefix server install
 npm run dev:server
 ```
 
-In another terminal:
+Terminal 2:
 
 ```bash
+npm --prefix client install
 npm run dev:client
 ```
 
-For local Google auth, set `VITE_API_URL=http://localhost:3001` and `VITE_GOOGLE_CLIENT_ID` in `client/.env`.
+Open:
+
+```text
+http://localhost:5173
+```
+
+## GitHub/Render note
+
+Do not commit these folders:
+
+```text
+node_modules/
+client/node_modules/
+server/node_modules/
+client/dist/
+```
+
+They are ignored by `.gitignore`.
