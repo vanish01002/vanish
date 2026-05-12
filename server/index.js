@@ -143,6 +143,7 @@ function leaveRoom(client, reason = "left") {
   if (!room) {
     client.roomId = null;
     client.state = "idle";
+    client.typingState = false;
     return;
   }
 
@@ -151,6 +152,7 @@ function leaveRoom(client, reason = "left") {
 
   client.roomId = null;
   client.state = "idle";
+  client.typingState = false;
 
   if (other) {
     other.roomId = null;
@@ -182,6 +184,8 @@ function relayChat(client, rawText) {
   room.buffer.push({ from: client.id, text, ts: now() });
   if (room.buffer.length > 20) room.buffer.shift();
 
+  client.typingState = false;
+  send(other.ws, "chat:typing", { isTyping: false });
   send(other.ws, "chat:message", { text });
 }
 
@@ -191,6 +195,22 @@ function relayToRoom(client, type, payload = {}) {
   const other = otherClient(room, client);
   if (!other) return;
   send(other.ws, type, payload);
+}
+
+function relayTyping(client, isTyping) {
+  const room = rooms.get(client.roomId);
+  if (!room) return;
+
+  const nextState = Boolean(isTyping);
+
+  // Prevent duplicate typing events. A user pressing multiple keys/spaces
+  // should not create repeated "Stranger is typing..." indicators.
+  if (client.typingState === nextState) return;
+
+  client.typingState = nextState;
+  const other = otherClient(room, client);
+  if (!other) return;
+  send(other.ws, "chat:typing", { isTyping: nextState });
 }
 
 function reportUser(client, reason) {
@@ -247,7 +267,7 @@ function handleMessage(client, raw) {
 
     case "chat:typing":
     case "typing":
-      relayToRoom(client, "chat:typing", { isTyping: Boolean(payload.isTyping ?? payload.typing) });
+      relayTyping(client, Boolean(payload.isTyping ?? payload.typing));
       break;
 
     case "match:skip":
@@ -354,6 +374,7 @@ wss.on("connection", (ws, req) => {
     profile: null,
     roomId: null,
     state: "idle",
+    typingState: false,
     queuedAt: null,
     messageHits: [],
     connectedAt: now(),
